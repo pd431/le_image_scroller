@@ -128,6 +128,8 @@
   .status-icon.correct::after { content: "✓"; }
   .status-icon.incorrect { border: 2px solid #b1493c; background: #3a1c17; color: #ff9d8f; }
   .status-icon.incorrect::after { content: "✕"; }
+  .status-icon.skipped { border: 2px solid #9599a4; color: #c8cfda; }
+  .status-icon.skipped::after { content: "–"; }
 
   .note {
     margin-top: 1.2rem;
@@ -193,8 +195,12 @@
             <span class="sub">Drag a type from the left palette onto the spot on the slice — or on touch, tap the type, then tap the slice. Fill in its content in the panel on the right.</span>
           </li>
           <li>
-            <strong>Set its acceptable range</strong>
+            <strong>Set its acceptable zone</strong>
             <span class="sub">A radius slider is the quick default; "Draw shape" lets you trace a custom region instead — this is how close a student's guess needs to be to count as correct.</span>
+          </li>
+          <li>
+            <strong>Span several slices if the feature does</strong>
+            <span class="sub">In the "Slices" section set a from/to range and the annotation appears on every slice in it, with the same zone. Switch "Edit zone on" to the current slice to move or resize the zone on that slice only; adjusted slices are listed so you can revisit or reset them.</span>
           </li>
           <li>
             <strong>Browse and fix things up</strong>
@@ -202,7 +208,7 @@
           </li>
           <li>
             <strong>Export</strong>
-            <span class="sub">Choose <strong>Quiz</strong> (students place things themselves) or <strong>Showcase</strong> (read-only walkthrough) — and for a quiz, <strong>Full challenge</strong> (find the slice too) or <strong>Guided</strong> (slice is hinted). Downloads <code>annotations.json</code>.</span>
+            <span class="sub">Choose <strong>Quiz</strong> (students place things themselves) or <strong>Showcase</strong> (read-only walkthrough) — and for a quiz, <strong>Full challenge</strong> (slice hints only after a miss) or <strong>Guided</strong> (slices hinted from the start). Downloads <code>annotations.json</code>, stamped with a fingerprint of the image stack so the quiz can warn if the images change.</span>
           </li>
         </ol>
 
@@ -215,7 +221,7 @@
           <li class="row"><span class="dot mcq"></span> <strong>MCQ</strong> — marker with a multiple-choice question</li>
         </ul>
 
-        <div class="note">Work autosaves to the browser as you go. <strong>Import…</strong> loads a previous export back in for further editing.</div>
+        <div class="note">Work autosaves to the browser as you go, in a slot tied to this image stack; a banner warns if the browser is blocking storage. <strong>Import…</strong> loads a previous export back in for further editing, and asks first if the file was made for a different image stack.</div>
       </section>
 
       <section class="panel">
@@ -224,38 +230,39 @@
 
         <p style="margin:0 0 0.8rem;font-size:0.88rem;"><strong>If it's a Showcase:</strong> click any item in the list — it jumps to the right slice and shows its full content. Nothing to do but read.</p>
 
-        <p style="margin:0 0 0.6rem;font-size:0.88rem;"><strong>If it's a Quiz:</strong></p>
+        <p style="margin:0 0 0.6rem;font-size:0.88rem;"><strong>If it's a Quiz:</strong> you work through the items one at a time.</p>
         <ol class="steps">
           <li>
-            <strong>Pick an item to place</strong>
-            <span class="sub">Tap it in the "To place" list (it "arms"), then tap the slice where you think it belongs — or drag it onto the stage. In guided quizzes, a small dot on the slider hints the right slice.</span>
+            <strong>Start</strong>
+            <span class="sub">The panel on the right tells you how many items there are. Press Start (or Continue, if you've been here before — progress is saved in this browser).</span>
           </li>
           <li>
-            <strong>Answer MCQs directly</strong>
-            <span class="sub">MCQs are already placed for you — click one in the list to jump straight to it, then choose an answer from the dropdown.</span>
+            <strong>Place the current item</strong>
+            <span class="sub">Scrub through the slices, then tap the spot where you think the feature belongs. Drag your marker to adjust it, then press <strong>Check placement</strong>. In guided quizzes a highlight under the slider shows which slices to look at.</span>
           </li>
           <li>
-            <strong>Adjust anytime</strong>
-            <span class="sub">Drag a placed marker to reposition it, or reopen it from the list to review or clear it.</span>
+            <strong>Answer MCQs in place</strong>
+            <span class="sub">Questions are already sitting at their true spot (the ? marker). Pick an answer and press <strong>Check answer</strong>.</span>
           </li>
           <li>
-            <strong>Check your answers</strong>
-            <span class="sub">Grades everything at once and reveals the true location/content for anything you attempted.</span>
+            <strong>Miss? You get help</strong>
+            <span class="sub">The feedback says whether it was the wrong slice or the wrong spot. After one miss you're told which slices to look at; after two, the accepted zone is outlined; after three, <strong>Show me</strong> reveals it (counted as shown, not solved).</span>
           </li>
           <li>
-            <strong>Try again</strong>
-            <span class="sub">Clears every attempt so you can have another go.</span>
+            <strong>Skip and come back</strong>
+            <span class="sub">Skip moves on; any item in the Progress list can be reopened. <strong>Summary</strong> shows how you did and lets you retry any item; <strong>Start over</strong> wipes everything.</span>
           </li>
         </ol>
 
         <hr class="divider" />
 
-        <p style="margin:0 0 0.5rem;font-size:0.82rem;color:#9aa4b2;">Status icons (quiz list)</p>
+        <p style="margin:0 0 0.5rem;font-size:0.82rem;color:#9aa4b2;">Status icons (progress list)</p>
         <ul class="legend">
-          <li class="row"><span class="status-icon unplaced"></span> Not placed/answered yet</li>
+          <li class="row"><span class="status-icon unplaced"></span> Not started</li>
           <li class="row"><span class="status-icon placed"></span> Attempted, not yet checked</li>
+          <li class="row"><span class="status-icon skipped"></span> Skipped</li>
           <li class="row"><span class="status-icon correct"></span> Correct</li>
-          <li class="row"><span class="status-icon incorrect"></span> Incorrect</li>
+          <li class="row"><span class="status-icon incorrect"></span> Shown (used "Show me")</li>
         </ul>
 
         <div class="note"><strong>Import…</strong> loads a different <code>annotations.json</code> if you have one — otherwise the quiz uses whatever file is bundled next to the page.</div>
@@ -269,7 +276,9 @@
           <code>.webp</code> images into <code>data/slices/</code> (names can have spaces), then run
           <code>python3 scripts/build_manifest.py</code> to rebuild the slice list — files sort naturally by
           name, so <code>abc2.jpg</code> comes before <code>abc10.jpg</code> whether or not you zero-pad.
-          See the <a href="README.md" style="color:#8fb3ff">README</a>
+          The script also records a fingerprint of the stack, which exports carry, so both tools can warn
+          when an annotations file doesn't match the images. Changing, adding or renaming a slice shifts
+          the numbering, so re-export after any change to the images. See the <a href="README.md" style="color:#8fb3ff">README</a>
           for the full technical reference, including the <code>annotations.json</code> schema.
         </p>
       </section>

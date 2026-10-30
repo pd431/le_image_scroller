@@ -9,10 +9,45 @@ no server-side storage) built around a stack of sliced scan images:
    and practice placing the known features on the correct slice.
 
 Everything the site needs is just files in this folder — it can be
-hosted as-is (e.g. as a Moodle-embeddable static page).
+hosted as-is (e.g. as a Moodle-embeddable static page). It is meant for
+self-testing and sharing information with students, not for summative
+assessment: the quiz's answers live in a plain file the browser
+downloads, so anyone can read them.
 
 See **[guide.html](guide.html)** for a short, task-oriented walkthrough
 of both tools — this README is the fuller technical reference.
+
+Layout:
+
+```
+annotator/   educator tool (index.html, app.js, style.css)
+quiz/        student tool (index.html, app.js, style.css, annotations.json)
+shared/      common.js (runtime shared by both) and theme.css (colour tokens + layout)
+data/slices/ the image stack and its manifest.json
+scripts/     build_manifest.py, generate_slices.py, check_contrast.py
+tests/       Playwright end-to-end tests and Python unit tests
+```
+
+## Serving and hosting
+
+The pages fetch their data, so they must be served over HTTP (opening
+`index.html` from the file system shows an explanation instead):
+
+```
+python3 -m http.server 8000      # then open http://localhost:8000/annotator/
+```
+
+For Moodle, upload the whole folder as-is (a File resource or a folder
+on the web server) and link to `quiz/index.html`. Notes:
+
+- Serve over **https** where you can. Browsers block storage inside a
+  cross-site frame in some configurations; when that happens the apps
+  show a banner saying autosave / progress saving is off, and exporting
+  is the only way to keep work.
+- Each page carries a `Content-Security-Policy` meta tag that allows
+  only the folder's own scripts to run, as a backstop behind the input
+  handling described under *Security* below.
+- Grades do not reach the Moodle gradebook; the score is on-screen only.
 
 ## Dataset
 
@@ -63,6 +98,16 @@ leaves the images themselves untouched and only refreshes the file
 list, so it's safe to run alongside (or instead of) the apple
 generator above.
 
+The script also writes a SHA-256 per file (`fileHashes`) and a
+`datasetHash` fingerprint of the whole ordered stack. Exports carry the
+fingerprint, and both tools compare it against the manifest when a file
+is loaded: the annotator asks before importing a file made for a
+different stack, and the quiz shows a warning but still loads. Adding,
+removing, renaming or re-ordering a slice changes the numbering every
+annotation depends on, so re-export after any change to the images.
+Slices shown as **SVG** go through a sanitiser (see *Security*); raster
+images are shown as plain pictures.
+
 Non-SVG images are shown as plain pictures — layer auto-detection in
 the annotator (which relies on `data-layer` attributes on SVG shapes)
 just won't find a layer for them, which is already handled gracefully
@@ -95,9 +140,9 @@ on the right, where every field is live-bound — no separate save step.
 Markers can be dragged to reposition (a plain click opens the
 inspector instead; dragging re-detects the layer on release).
 
-Every annotation also carries an **acceptable range** — the tolerance
+Every annotation also carries an **acceptable zone** — the tolerance
 the quiz tool will use to judge a student's placement as correct. The
-inspector's "Acceptable range" section offers two modes:
+inspector's "Acceptable zone" section offers two modes:
 
 - **Radius** (default, quick) — a slider sets a tolerance circle
   centred on the pin, shown live on the slice.
@@ -111,38 +156,64 @@ annotation across the whole stack, sortable by slice order, type, or
 title (A–Z / Z–A); clicking an entry jumps straight to its slice and
 opens it in the inspector.
 
-Annotations autosave to the browser's local storage as you work.
+An annotation can **span several slices**: the inspector's "Slices"
+section takes a from/to range and the annotation then appears on every
+slice in it with the same zone. "Edit zone on: slice N only" switches
+the position and tolerance controls (and marker dragging) to a
+per-slice override for the current slice; adjusted slices are listed
+with a reset button, and a dashed ring marks an overridden marker.
+"This slice only" collapses the range back to one slice, keeping the
+zone in effect on the slice you're looking at.
+
+Annotations autosave to the browser's local storage as you work, in a
+slot keyed by the image stack's fingerprint, so two copies of the tool
+on one host with different stacks don't overwrite each other. If
+storage is blocked or full, a banner says so (the work stays in memory
+until you export). Work saved by the pre-fingerprint version is offered
+for recovery once.
+
 **Export annotations** first asks what the export is for, then
 downloads a single `annotations.json` (schema below) for the quiz
-tool to consume; **Import…** loads one back in for further editing.
+tool to consume; **Import…** loads one back in for further editing,
+validating every entry (bad ones are skipped and reported) and
+converting older exports.
 
 - **Quiz vs. showcase** — Quiz: students place the features themselves
   and get checked. Showcase: a read-only walkthrough of the annotated
   slices (no placing, everything is already shown).
 - **Quiz mode** (quiz exports only) — **Full challenge**: students
-  must find both the right slice and the right spot. **Guided**:
-  students are shown which slice each feature is on (via small markers
-  on the quiz tool's slider) and only need to find the right spot.
+  must find both the right slice and the right spot; slice hints appear
+  only after a miss. **Guided**: the slice range for the current item
+  is highlighted under the slider from the start, so only the spot is
+  tested.
 
 ```jsonc
 {
-  "version": 2,
+  "version": 3,
   "exportMode": "quiz", // or "showcase"
   "quizMode": "guided", // "full" | "guided" - only present when exportMode is "quiz"
+  "datasetHash": "f54b…", // from data/slices/manifest.json; null if the stack has none
   "dataset": { "size": 400, "sliceCount": 40, "axis": "height, bottom to top" },
   "annotations": [
-    { "id": "…", "type": "label", "sliceIndex": 18, "layer": "core", "x": 0.5, "y": 0.5, "text": "Core",
+    { "id": "…", "type": "label", "sliceFrom": 18, "sliceTo": 18, "layer": "core", "x": 0.5, "y": 0.5, "text": "Core",
       "tolerance": { "mode": "radius", "radius": 0.06 } },
-    { "id": "…", "type": "pin", "sliceIndex": 18, "layer": "flesh", "x": 0.28, "y": 0.5,
+    { "id": "…", "type": "pin", "sliceFrom": 16, "sliceTo": 21, "layer": "flesh", "x": 0.28, "y": 0.5,
       "title": "Flesh", "description": "…",
-      "tolerance": { "mode": "radius", "radius": 0.2 } },
-    { "id": "…", "type": "mcq", "sliceIndex": 18, "layer": "flesh", "x": 0.5, "y": 0.38,
+      "tolerance": { "mode": "radius", "radius": 0.2 },
+      "overrides": { "19": { "x": 0.3, "y": 0.52, "tolerance": { "mode": "radius", "radius": 0.15 } } } },
+    { "id": "…", "type": "mcq", "sliceFrom": 22, "sliceTo": 22, "layer": "flesh", "x": 0.5, "y": 0.38,
       "question": "What condition does this point to?",
       "options": ["Rot", "Bite mark", "Healthy apple"], "answer": "Healthy apple",
       "tolerance": { "mode": "polygon", "polygon": [{ "x": 0.42, "y": 0.35 }, { "x": 0.58, "y": 0.35 }, { "x": 0.58, "y": 0.55 }, { "x": 0.42, "y": 0.55 }] } }
   ]
 }
 ```
+
+An annotation applies to every slice from `sliceFrom` to `sliceTo`
+inclusive. `x`/`y`/`tolerance` are its default zone; `overrides` maps a
+slice index to a zone that replaces the default on that slice only.
+Version 2 files (single `sliceIndex`) are accepted by both tools and
+upgraded on import.
 
 `x`/`y` (and polygon point coordinates) are fractions (0–1) of the
 slice image, so positions stay correct regardless of display size.
@@ -152,36 +223,75 @@ slice image, so positions stay correct regardless of display size.
 
 The student-facing tool. Loads `quiz/annotations.json` (a static file
 next to the page — replace it with your own export from the
-annotator) by default, or **Import…** a different one on the fly.
-Works the same across desktop, iPad and phones as the annotator.
+annotator) by default, or **Import…** a different one on the fly. If
+the file doesn't match the image stack a warning is shown and the quiz
+still loads. Works the same across desktop, iPad and phones as the
+annotator.
 
 **Showcase files** render read-only: a sortable "All annotations" list
 (slice order / type / title A–Z / Z–A) navigates to each feature's
 slice and shows its full content — for MCQs, every option is shown
-with the correct one highlighted.
+with the correct one highlighted. Multi-slice annotations appear on
+each slice in their range.
 
-**Quiz files** show a "To place" list built from each annotation's
-public-safe prompt (a label's text, a pin's title, an MCQ's question +
-options) — never its slice or position. Tap a label/pin item (it
-"arms"), then tap the slice where you think it belongs — or
-press-and-drag it onto the stage, same as the annotator's palette.
-Placed items can be dragged to reposition, or re-opened from the list
-to review or clear. In **guided** exports, small dots below the slider
-hint which slice each label/pin item belongs to (the currently-selected
-item's dot is highlighted); a separate row of dots always shows which
-slices you've placed something on.
+**Quiz files** walk the student through the items **one at a time**:
 
-**MCQs work differently, regardless of quiz mode**: an MCQ is a
-question about a specific spot, not a test of whether you can find it,
-so it's always shown already sitting at its true location and slice —
-clicking it in the list jumps straight there (a slider hint for it
-always shows too, even in *full challenge* exports) and all you do is
-pick an answer from the dropdown.
+1. A start screen says how many items there are and what to do.
+2. The current item's prompt (a label's text, a pin's title, an MCQ's
+   question) is shown with a step counter. Label/pin items: scrub to a
+   slice and tap the spot; the marker can be dragged; **Check
+   placement** grades it (right slice range *and* inside that slice's
+   zone). MCQs always sit at their true spot: pick an option and
+   **Check answer**.
+3. Feedback is immediate and escalates: a miss says whether it was the
+   wrong slice or the wrong spot; after one miss the slice range is
+   given (and highlighted under the slider); after two the accepted
+   zone is outlined; after three (two for MCQs) **Show me** reveals it,
+   recorded as "shown" rather than solved.
+4. **Skip** moves on; any item can be reopened from the Progress list,
+   whose status glyphs are ring (not started), dot (attempted), dash
+   (skipped), tick (correct) and cross (shown).
+5. **Summary** lists every item with how many tries it took and lets
+   the student retry any of them; **Start over** clears everything.
 
-Status icons in the list track each item: empty ring (not
-placed/answered), filled dot (attempted, not yet checked), green check
-/ red cross (graded). **Check my answers** grades every item at once —
-label/pin: right slice *and* landing inside the annotation's
-acceptable range (circle or custom polygon); MCQ: right dropdown
-choice — and reveals the true location/content for anything attempted.
-**Try again** clears every attempt and starts over.
+Progress is saved in the browser under a key made from the image
+stack's fingerprint and the annotations file's hash, so a reload
+resumes where the student left off and a different file starts fresh.
+
+## Security
+
+The pages are static, so the attack surface is the files they load:
+
+- **Slice SVGs** are shown inline (so `data-layer` shapes are real DOM
+  nodes), which means an SVG could carry script. Every SVG goes through
+  `Scanner.sanitizeSvg` in `shared/common.js`: it parses the file,
+  copies only allow-listed elements and attributes into freshly
+  created nodes, and drops everything else (`script`, `foreignObject`,
+  `image`, `use`, `a`, animation elements, `on*` handlers, `style`
+  with `url()`, and any `url()` that isn't a same-document `#id`).
+  Raster slices are shown with `<img>` and need no sanitising.
+- **Annotation files** (bundled, imported or autosaved) are validated
+  field by field; nothing from them is written to the page unescaped.
+- A **Content-Security-Policy** meta tag on every page restricts script
+  to the folder's own files as a backstop.
+
+What this does *not* give you: the quiz answers are in
+`annotations.json`, readable by anyone who can open the page.
+
+## Development and tests
+
+```
+npm install            # Playwright, for the browser tests
+npm test               # end-to-end tests (headless Chromium, ~10 s)
+npm run test:py        # Python unit tests: manifest hashing, contrast maths
+npm run check:contrast # APCA + WCAG 2.2 AA check of the colour tokens
+npm run check:all      # all three
+```
+
+`shared/theme.css` holds every colour as a token on `:root`.
+`scripts/check_contrast.py` checks each foreground/background pairing
+the UI uses against APCA (Lc 75 body text, Lc 60 large/UI text, Lc 45
+non-text) and WCAG 2.2 AA (4.5:1 text, 3:1 large text and non-text),
+and exits non-zero on failure. When you add a colour, add its pairing
+to `PAIRS` in that script. Keyboard-only operation of marker placement
+is not supported yet.

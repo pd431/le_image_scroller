@@ -3,6 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self'; connect-src 'self'; object-src 'none'; base-uri 'none'" />
 <title>Slice dataset preview</title>
 <style>
   :root { color-scheme: dark; }
@@ -46,6 +47,7 @@
     font: inherit;
   }
   button:hover { background: #262f42; }
+  .error { color: #ffc0c0; max-width: 60ch; text-align: center; font-size: 0.9rem; }
 </style>
 </head>
 <body>
@@ -57,54 +59,6 @@
     <span class="readout" id="readout">1 / ?</span>
   </div>
 
-  <script>
-    const frame = document.getElementById("frame");
-    const scrub = document.getElementById("scrub");
-    const readout = document.getElementById("readout");
-    const playBtn = document.getElementById("play");
-
-    let manifest = null;
-    let playing = false;
-    let timer = null;
-
-    function show(index) {
-      frame.src = `data/slices/${encodeURIComponent(manifest.files[index - 1])}`;
-      readout.textContent = `${index} / ${manifest.sliceCount}`;
-      scrub.value = index;
-    }
-
-    function stopPlaying() {
-      playing = false;
-      playBtn.textContent = "Play";
-      clearInterval(timer);
-    }
-
-    scrub.addEventListener("input", () => {
-      stopPlaying();
-      show(Number(scrub.value));
-    });
-
-    playBtn.addEventListener("click", () => {
-      if (playing) {
-        stopPlaying();
-        return;
-      }
-      playing = true;
-      playBtn.textContent = "Pause";
-      timer = setInterval(() => {
-        let next = Number(scrub.value) + 1;
-        if (next > manifest.sliceCount) next = 1;
-        show(next);
-      }, 120);
-    });
-
-    fetch("data/slices/manifest.json")
-      .then((r) => r.json())
-      .then((m) => {
-        manifest = m;
-        scrub.max = m.sliceCount;
-        show(1);
-      });
-  </script>
+  <script src="preview.js"></script>
 </body>
 </html>
