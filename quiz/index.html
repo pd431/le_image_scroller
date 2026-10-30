@@ -3,7 +3,11 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<!-- Only this folder's own scripts may run: the backstop behind the SVG
+     sanitiser and output escaping in app.js. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'" />
 <title>Quiz</title>
+<link rel="stylesheet" href="../shared/theme.css" />
 <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -12,10 +16,11 @@
     <div class="dataset-info" id="datasetInfo">Loading…</div>
     <div class="actions">
       <a class="guide-link" href="../guide.html">Guide</a>
-      <button id="importBtn">Import…</button>
-      <input type="file" id="importFile" accept="application/json" hidden />
+      <button id="importBtn" type="button">Import…</button>
+      <input type="file" id="importFile" accept="application/json,.json" hidden />
     </div>
   </header>
+  <div class="notices" id="notices"></div>
 
   <main>
     <aside class="side-panel panel">
@@ -36,15 +41,13 @@
       </section>
 
       <section id="quizSection" hidden>
-        <h2>To place <span class="count" id="targetsCount">0</span></h2>
+        <h2>Progress <span class="count" id="progressCount">0 / 0</span></h2>
         <p class="hint" id="modeHint"></p>
-        <ul class="annotation-list" id="targetsList"></ul>
-      </section>
-
-      <section id="checkSection" hidden>
-        <button id="checkBtn">Check my answers</button>
-        <div class="score-summary" id="scoreSummary"></div>
-        <button id="resetBtn" class="danger" hidden>Try again</button>
+        <ul class="annotation-list targets" id="targetsList" aria-label="Quiz items"></ul>
+        <div class="btn-row" id="quizActions">
+          <button id="summaryBtn" type="button">Summary</button>
+          <button id="restartBtn" type="button" class="danger">Start over</button>
+        </div>
       </section>
     </aside>
 
@@ -52,26 +55,27 @@
       <div class="stage-wrap">
         <div class="stage" id="stage">
           <div class="svg-host" id="svgHost"></div>
-          <svg class="tolerance-layer" id="toleranceLayer" viewBox="0 0 400 400"></svg>
+          <svg class="tolerance-layer" id="toleranceLayer" viewBox="0 0 400 400" aria-hidden="true"></svg>
           <div class="marker-layer" id="markerLayer"></div>
         </div>
       </div>
       <div class="controls">
-        <button id="play">Play</button>
+        <button id="play" type="button" aria-pressed="false">Play</button>
         <div class="slider-wrap">
-          <input id="scrub" type="range" min="1" value="1" step="1" />
-          <div class="tick-row hint" id="hintTicks"></div>
-          <div class="tick-row mine" id="mineTicks"></div>
+          <input id="scrub" type="range" min="1" value="1" step="1" aria-label="Slice" />
+          <div class="tick-row hint" id="hintTicks" aria-hidden="true"></div>
+          <div class="tick-row mine" id="mineTicks" aria-hidden="true"></div>
         </div>
-        <span class="readout" id="readout">1 / ?</span>
+        <span class="readout" id="readout" aria-live="polite">1 / ?</span>
       </div>
     </section>
 
-    <aside class="inspector panel" id="inspector">
+    <aside class="inspector panel" id="inspector" aria-live="polite">
       <p class="hint placeholder">Loading…</p>
     </aside>
   </main>
 
+  <script src="../shared/common.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

@@ -1,12 +1,22 @@
 (() => {
+  "use strict";
+  const S = window.Scanner;
+  const {
+    el, clamp, escapeHtml, TYPE_LABELS,
+    appliesToSlice, isMultiSlice, zoneFor, rangeLabel, gradePlacement,
+    summaryFor, iconHtmlFor, sortAnnotations, toleranceShapeMarkup, sliderFraction,
+  } = S;
+
   const MANIFEST_URL = "../data/slices/manifest.json";
   const SLICE_URL = (filename) => `../data/slices/${encodeURIComponent(filename)}`;
-  const isSvgFilename = (filename) => /\.svg$/i.test(filename);
   const DEFAULT_EXPORT_URL = "annotations.json";
-  const TYPE_LABELS = { label: "Text label", pin: "Pin + description", mcq: "MCQ" };
-  const DEFAULT_TOLERANCE = { mode: "radius", radius: 0.06 };
 
-  const el = (id) => document.getElementById(id);
+  // How many misses before each level of help. Placement items get three
+  // chances before "Show me" is offered; MCQs get two.
+  const HINT_RANGE_AFTER = 1;
+  const HINT_ZONE_AFTER = 2;
+  const SHOW_ME_AFTER = { label: 3, pin: 3, mcq: 2 };
+
   const stage = el("stage");
   const svgHost = el("svgHost");
   const toleranceLayer = el("toleranceLayer");
@@ -28,299 +38,383 @@
 
   const quizSection = el("quizSection");
   const targetsListEl = el("targetsList");
-  const targetsCountEl = el("targetsCount");
+  const progressCountEl = el("progressCount");
   const modeHintEl = el("modeHint");
-
-  const checkSection = el("checkSection");
-  const checkBtn = el("checkBtn");
-  const resetBtn = el("resetBtn");
-  const scoreSummaryEl = el("scoreSummary");
+  const summaryBtn = el("summaryBtn");
+  const restartBtn = el("restartBtn");
 
   const state = {
     manifest: null,
-    quiz: null, // { exportMode, quizMode, dataset, annotations }
-    targets: [], // quiz mode: annotations + studentAnswer/studentChoice/outcome
+    loader: null,
+    player: null,
+    quiz: null, // parsed export file
+    store: null,
+    targets: [], // annotations + student state (see freshTarget)
     currentIndex: 1,
-    selectedId: null,
-    armedId: null,
-    checked: false,
-    playing: false,
-    playTimer: null,
+    phase: "start", // "start" | "item" | "summary"   (quiz exports only)
+    currentId: null, // item being worked on (quiz) / selected (showcase)
   };
 
-  function clamp(v, min, max) {
-    return Math.min(max, Math.max(min, v));
-  }
-
-  function escapeHtml(str) {
-    return String(str).replace(/[&<>"']/g, (c) => (
-      { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
-    ));
-  }
-
-  function isPointInRect(x, y, rect) {
-    return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
-  }
-
-  // --- loading -------------------------------------------------------------
+  // --- loading ------------------------------------------------------------------------
 
   async function init() {
-    const manifestRes = await fetch(MANIFEST_URL);
-    state.manifest = await manifestRes.json();
-    toleranceLayer.setAttribute("viewBox", `0 0 ${state.manifest.size} ${state.manifest.size}`);
-    scrub.max = state.manifest.sliceCount;
-
-    let quiz = null;
     try {
-      const res = await fetch(DEFAULT_EXPORT_URL);
-      if (res.ok) quiz = await res.json();
-    } catch {
-      /* no bundled export - fine, the student can Import one */
+      state.manifest = await S.loadManifest(MANIFEST_URL);
+    } catch (err) {
+      S.showFatal(err);
+      return;
     }
+    const m = state.manifest;
+    state.loader = S.createSliceLoader({ host: svgHost, manifest: m, sliceUrl: SLICE_URL });
+    state.player = S.createPlayer({
+      button: playBtn,
+      interval: 300,
+      step: () => loadSlice(state.currentIndex >= m.sliceCount ? 1 : state.currentIndex + 1),
+    });
+    toleranceLayer.setAttribute("viewBox", `0 0 ${m.size} ${m.size}`);
+    scrub.max = m.sliceCount;
 
     wireGlobalControls();
 
-    if (quiz) {
-      await loadQuizData(quiz);
+    let bundled = null;
+    try {
+      bundled = await S.fetchJson(DEFAULT_EXPORT_URL, "The bundled annotations file");
+    } catch (err) {
+      // No bundled export (or a broken one): the student can still import.
+      if (!(err instanceof S.LoadError) || !/HTTP 404/.test(err.message)) {
+        S.notify("warn", `${err.message} Use Import… to load an annotations file.`, { id: "load" });
+      }
+    }
+
+    if (bundled) {
+      const parsed = S.parseExportFile(bundled.data, m.sliceCount);
+      if (parsed.error) {
+        S.notify("error", `The bundled annotations.json can't be used: ${parsed.error}. Use Import… to load another file.`, { id: "load" });
+        showEmpty();
+      } else {
+        await loadQuizData(parsed.file, bundled.text, "annotations.json");
+      }
     } else {
-      datasetInfo.textContent = "No annotation file loaded";
-      inspectorEl.innerHTML = `<p class="hint placeholder">No annotations.json found next to this page. Use Import… to load one exported from the annotator.</p>`;
+      showEmpty();
     }
   }
 
-  function isValidQuizFile(data) {
-    return data && Array.isArray(data.annotations) && (data.exportMode === "quiz" || data.exportMode === "showcase");
+  function showEmpty() {
+    datasetInfo.textContent = "No annotation file loaded";
+    inspectorEl.innerHTML = `<p class="hint placeholder">No annotations.json found next to this page. Use Import… to load one exported from the annotator.</p>`;
   }
 
-  async function loadQuizData(data) {
-    state.quiz = data;
-    state.targets = data.annotations.map((a) => ({
-      ...a,
-      tolerance: a.tolerance || { ...DEFAULT_TOLERANCE },
-      studentAnswer: null,
-      studentChoice: null,
-      outcome: null,
-    }));
-    state.selectedId = null;
-    state.armedId = null;
-    state.checked = false;
+  function freshTarget(ann) {
+    return {
+      ...ann,
+      placement: null, // { sliceIndex, x, y }
+      choice: null, // MCQ option text
+      tries: 0, // number of checks that came back wrong
+      status: "todo", // "todo" | "correct" | "revealed"
+      skipped: false,
+      lastResult: null, // { correct, reason } from the latest check
+    };
+  }
 
-    const modeLabel = data.exportMode === "quiz"
-      ? `Quiz · ${data.quizMode === "guided" ? "guided" : "full challenge"}`
+  async function loadQuizData(file, rawText, sourceName) {
+    state.quiz = file;
+    state.targets = file.annotations.map(freshTarget);
+    state.currentId = null;
+    state.phase = "start";
+
+    const fileHash = S.sha256Hex(rawText || JSON.stringify(file));
+    state.store = S.createStore(`quiz:${state.manifest.datasetHash || "unfingerprinted"}:${fileHash}:v3`);
+
+    const check = S.compareDataset(file, state.manifest);
+    if (check.status === "mismatch") {
+      S.notify("warn", `${check.message} Markers may not line up with the images.`, { id: "dataset" });
+    } else if (check.status === "unverified") {
+      S.notify("info", check.message, { id: "dataset" });
+    } else {
+      S.dismissNotice("dataset");
+    }
+    if (file.rejected.length) {
+      S.notify("warn", `${file.rejected.length} entr${file.rejected.length === 1 ? "y" : "ies"} in ${sourceName} could not be used (${S.describeRejected(file.rejected)}).`, { id: "rejected" });
+    } else {
+      S.dismissNotice("rejected");
+    }
+
+    const n = state.targets.length;
+    const modeLabel = file.exportMode === "quiz"
+      ? `Quiz · ${file.quizMode === "guided" ? "guided" : "full challenge"}`
       : "Showcase";
-    datasetInfo.textContent = `${modeLabel} · ${state.targets.length} annotation${state.targets.length === 1 ? "" : "s"}`;
+    datasetInfo.textContent = `${modeLabel} · ${n} item${n === 1 ? "" : "s"}`;
 
-    showcaseSection.hidden = data.exportMode !== "showcase";
-    quizSection.hidden = data.exportMode !== "quiz";
-    checkSection.hidden = data.exportMode !== "quiz";
-    resetBtn.hidden = true;
-    scoreSummaryEl.textContent = "";
+    showcaseSection.hidden = file.exportMode !== "showcase";
+    quizSection.hidden = file.exportMode !== "quiz";
 
-    if (data.exportMode === "quiz") {
-      const base = data.quizMode === "guided"
-        ? "Tap an item, then tap the slice where you think it belongs. Small markers on the slider below show which slice each item is on."
-        : "Tap an item, then tap the slice where you think it belongs — you'll need to find the right slice yourself.";
-      modeHintEl.textContent = `${base} MCQ items are already placed for you — just open one and choose an answer.`;
+    if (file.exportMode === "quiz") {
+      modeHintEl.textContent = file.quizMode === "guided"
+        ? "You'll be shown which slices each feature is on; find the right spot."
+        : "Find both the right slice and the right spot. Hints appear if you miss.";
+      restoreProgress();
+      if (!S.storageAvailable()) {
+        S.notify("info", "This browser is blocking storage, so your progress won't survive a page reload.", { id: "storage" });
+      }
     }
 
     await loadSlice(1);
-    renderShowcaseList();
-    renderTargetsList();
-    renderTicks();
+    renderAll();
   }
 
-  // SVGs are fetched and injected inline so their shapes are real DOM
-  // elements; any other image format (a real scan export - PNG/JPG/etc.)
-  // is just rendered as a plain <img>.
-  async function loadSliceImage(filename) {
-    svgHost.innerHTML = "";
-    if (isSvgFilename(filename)) {
-      const res = await fetch(SLICE_URL(filename));
-      svgHost.innerHTML = await res.text();
-      return;
-    }
-    const img = document.createElement("img");
-    img.src = SLICE_URL(filename);
-    img.alt = "";
-    img.draggable = false;
-    svgHost.appendChild(img);
+  // --- progress persistence (quiz exports) ---------------------------------------------
+
+  function saveProgress() {
+    if (!state.store || !state.quiz || state.quiz.exportMode !== "quiz") return;
+    const items = {};
+    state.targets.forEach((t) => {
+      items[t.id] = {
+        placement: t.placement, choice: t.choice, tries: t.tries, status: t.status, skipped: t.skipped, lastResult: t.lastResult,
+      };
+    });
+    state.store.write({ phase: state.phase, currentId: state.currentId, items });
   }
+
+  function restoreProgress() {
+    const saved = state.store.read();
+    if (!saved || typeof saved !== "object" || !saved.items) return;
+    let any = false;
+    state.targets.forEach((t) => {
+      const s = saved.items[t.id];
+      if (!s || typeof s !== "object") return;
+      any = true;
+      const p = s.placement;
+      t.placement = p && Number.isInteger(p.sliceIndex) && Number.isFinite(p.x) && Number.isFinite(p.y)
+        ? { sliceIndex: clamp(p.sliceIndex, 1, state.manifest.sliceCount), x: clamp(p.x, 0, 1), y: clamp(p.y, 0, 1) }
+        : null;
+      t.choice = typeof s.choice === "string" && (t.options || []).includes(s.choice) ? s.choice : null;
+      t.tries = Number.isInteger(s.tries) && s.tries >= 0 ? s.tries : 0;
+      t.status = ["todo", "correct", "revealed"].includes(s.status) ? s.status : "todo";
+      t.skipped = !!s.skipped;
+      t.lastResult = s.lastResult && typeof s.lastResult === "object" ? { correct: !!s.lastResult.correct, reason: String(s.lastResult.reason || "") } : null;
+    });
+    if (!any) return;
+    state.phase = ["start", "item", "summary"].includes(saved.phase) ? saved.phase : "item";
+    state.currentId = state.targets.some((t) => t.id === saved.currentId) ? saved.currentId : null;
+    if (state.phase === "item" && !state.currentId) state.currentId = (nextTodo(null) || state.targets[0] || {}).id || null;
+  }
+
+  // --- slice navigation ------------------------------------------------------------------
 
   async function loadSlice(index) {
+    index = clamp(index, 1, state.manifest.sliceCount);
+    const shown = await state.loader.load(index);
+    if (!shown) return;
     state.currentIndex = index;
-    if (state.selectedId) {
-      const sel = state.targets.find((t) => t.id === state.selectedId);
-      const stillRelevant = sel && (
-        (state.quiz.exportMode === "showcase" && sel.sliceIndex === index) ||
-        (state.quiz.exportMode === "quiz" && sel.studentAnswer && sel.studentAnswer.sliceIndex === index)
-      );
-      if (!stillRelevant && state.quiz.exportMode === "showcase") state.selectedId = null;
-    }
-
-    const filename = state.manifest.files[index - 1];
-    await loadSliceImage(filename);
     scrub.value = index;
     readout.textContent = `${index} / ${state.manifest.sliceCount}`;
+    if (state.quiz && state.quiz.exportMode === "showcase" && state.currentId) {
+      const sel = findTarget(state.currentId);
+      if (!sel || !appliesToSlice(sel, index)) state.currentId = null;
+    }
+    renderStage();
+    renderInspector();
+    if (state.quiz && state.quiz.exportMode === "showcase") renderShowcaseList();
+  }
 
+  function findTarget(id) {
+    return state.targets.find((t) => t.id === id);
+  }
+
+  function currentTarget() {
+    return state.quiz && state.quiz.exportMode === "quiz" && state.phase === "item" ? findTarget(state.currentId) : null;
+  }
+
+  // --- quiz flow ---------------------------------------------------------------------------
+
+  function isDone(t) {
+    return t.status === "correct" || t.status === "revealed";
+  }
+
+  function nextTodo(afterId) {
+    const start = afterId ? state.targets.findIndex((t) => t.id === afterId) + 1 : 0;
+    for (let i = 0; i < state.targets.length; i++) {
+      const t = state.targets[(start + i) % state.targets.length];
+      if (!isDone(t)) return t;
+    }
+    return null;
+  }
+
+  function startQuiz() {
+    state.phase = "item";
+    goToItem((nextTodo(null) || state.targets[0]).id);
+  }
+
+  async function goToItem(id) {
+    const t = findTarget(id);
+    if (!t) return;
+    state.player.stop();
+    state.phase = "item";
+    state.currentId = id;
+    saveProgress();
+    // Jump to where the student is working on it: their placement, or the
+    // true slice for MCQs (always shown in place) and anything already solved.
+    const target = t.type === "mcq" || isDone(t)
+      ? (appliesToSlice(t, state.currentIndex) ? null : t.sliceFrom)
+      : (t.placement ? t.placement.sliceIndex : null);
+    if (target && target !== state.currentIndex) await loadSlice(target);
+    renderAll();
+  }
+
+  function advance() {
+    const next = nextTodo(state.currentId);
+    if (next) goToItem(next.id);
+    else showSummary();
+  }
+
+  function skipCurrent() {
+    const t = currentTarget();
+    if (!t) return;
+    t.skipped = true;
+    const next = nextTodo(t.id);
+    if (next && next.id !== t.id) goToItem(next.id);
+    else showSummary();
+  }
+
+  function showSummary() {
+    state.phase = "summary";
+    state.currentId = null;
+    saveProgress();
+    renderAll();
+  }
+
+  function hintLevel(t) {
+    if (t.type === "mcq") return 0;
+    if (state.quiz.quizMode === "guided") return Math.max(1, t.tries >= HINT_ZONE_AFTER ? 2 : 1);
+    if (t.tries >= HINT_ZONE_AFTER) return 2;
+    if (t.tries >= HINT_RANGE_AFTER) return 1;
+    return 0;
+  }
+
+  function canShowMe(t) {
+    return !isDone(t) && t.tries >= SHOW_ME_AFTER[t.type];
+  }
+
+  function checkCurrent() {
+    const t = currentTarget();
+    if (!t || isDone(t)) return;
+    let result;
+    if (t.type === "mcq") {
+      if (!t.choice) return;
+      result = { correct: t.choice === t.answer, reason: t.choice === t.answer ? "" : "choice" };
+    } else {
+      if (!t.placement) return;
+      result = gradePlacement(t, t.placement);
+    }
+    t.lastResult = result;
+    if (result.correct) t.status = "correct";
+    else t.tries += 1;
+    saveProgress();
+    renderAll();
+  }
+
+  function revealCurrent() {
+    const t = currentTarget();
+    if (!t || !canShowMe(t)) return;
+    t.status = "revealed";
+    t.lastResult = null;
+    saveProgress();
+    if (!appliesToSlice(t, state.currentIndex)) loadSlice(t.sliceFrom).then(renderAll);
+    else renderAll();
+  }
+
+  function retryItem(id) {
+    const t = findTarget(id);
+    if (!t) return;
+    Object.assign(t, { placement: null, choice: null, tries: 0, status: "todo", skipped: false, lastResult: null });
+    goToItem(id);
+  }
+
+  async function restartQuiz() {
+    const ok = await S.confirmDialog({
+      title: "Start over?",
+      message: "This clears every placement and answer and starts the quiz again.",
+      confirmLabel: "Start over",
+      danger: true,
+    });
+    if (!ok) return;
+    state.targets = state.quiz.annotations.map(freshTarget);
+    state.phase = "start";
+    state.currentId = null;
+    saveProgress();
+    renderAll();
+  }
+
+  function placeCurrent(clientX, clientY, rect) {
+    const t = currentTarget();
+    if (!t || t.type === "mcq" || isDone(t)) return;
+    t.placement = {
+      sliceIndex: state.currentIndex,
+      x: clamp((clientX - rect.left) / rect.width, 0, 1),
+      y: clamp((clientY - rect.top) / rect.height, 0, 1),
+    };
+    t.lastResult = null;
+    saveProgress();
+    renderAll();
+  }
+
+  // --- rendering ---------------------------------------------------------------------------
+
+  function renderAll() {
+    renderStage();
+    renderInspector();
+    if (!state.quiz) return;
+    if (state.quiz.exportMode === "showcase") renderShowcaseList();
+    else renderTargetsList();
+  }
+
+  function renderStage() {
     renderMarkers();
     renderToleranceOverlay();
-    renderInspector();
-  }
-
-  function stopPlaying() {
-    state.playing = false;
-    playBtn.textContent = "Play";
-    clearInterval(state.playTimer);
-  }
-
-  // --- grading ---------------------------------------------------------------
-
-  function pointInPolygon(x, y, polygon) {
-    let inside = false;
-    for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
-      const xi = polygon[i].x, yi = polygon[i].y;
-      const xj = polygon[j].x, yj = polygon[j].y;
-      const intersect = yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi;
-      if (intersect) inside = !inside;
-    }
-    return inside;
-  }
-
-  function isWithinTolerance(t, x, y) {
-    const tol = t.tolerance || DEFAULT_TOLERANCE;
-    if (tol.mode === "polygon" && tol.polygon && tol.polygon.length >= 3) {
-      return pointInPolygon(x, y, tol.polygon);
-    }
-    const r = tol.radius ?? DEFAULT_TOLERANCE.radius;
-    return Math.hypot(x - t.x, y - t.y) <= r;
-  }
-
-  function isAttempted(t) {
-    return !!t.studentAnswer || (t.type === "mcq" && !!t.studentChoice);
-  }
-
-  function checkAnswers() {
-    state.targets.forEach((t) => {
-      if (!isAttempted(t)) {
-        t.outcome = null;
-        return;
-      }
-      if (t.type === "mcq") {
-        // MCQs are always shown at their true spot (see renderMarkers) -
-        // the question is about identifying the condition, not finding the
-        // point, so only the chosen answer is graded.
-        t.outcome = t.studentChoice === t.answer ? "correct" : "incorrect";
-        return;
-      }
-      const posOk = !!t.studentAnswer &&
-        t.studentAnswer.sliceIndex === t.sliceIndex &&
-        isWithinTolerance(t, t.studentAnswer.x, t.studentAnswer.y);
-      t.outcome = posOk ? "correct" : "incorrect";
-    });
-    state.checked = true;
-    resetBtn.hidden = false;
-    renderScoreSummary();
-    renderTargetsList();
-    renderMarkers();
-    renderToleranceOverlay();
-    renderInspector();
-  }
-
-  function resetAttempt() {
-    state.targets.forEach((t) => {
-      t.studentAnswer = null;
-      t.studentChoice = null;
-      t.outcome = null;
-    });
-    state.checked = false;
-    state.selectedId = null;
-    state.armedId = null;
-    resetBtn.hidden = true;
-    scoreSummaryEl.textContent = "";
-    stage.classList.remove("armed-mode");
-    renderTargetsList();
     renderTicks();
-    renderMarkers();
-    renderToleranceOverlay();
-    renderInspector();
+    const t = currentTarget();
+    stage.classList.toggle("armed-mode", !!t && t.type !== "mcq" && !isDone(t));
   }
-
-  function renderScoreSummary() {
-    const total = state.targets.length;
-    const correct = state.targets.filter((t) => t.outcome === "correct").length;
-    const attempted = state.targets.filter((t) => isAttempted(t)).length;
-    const allCorrect = correct === total && total > 0;
-    scoreSummaryEl.innerHTML = `<span class="tally${allCorrect ? " all-correct" : ""}">${correct} / ${total}</span> correct` +
-      (attempted < total ? ` · ${total - attempted} not attempted` : "");
-  }
-
-  // --- ticks (slider hints) ---------------------------------------------------
 
   function renderTicks() {
     hintTicksEl.innerHTML = "";
     mineTicksEl.innerHTML = "";
     if (!state.quiz || state.quiz.exportMode !== "quiz") return;
-
     const count = state.manifest.sliceCount;
-    const fracFor = (idx) => (count > 1 ? (idx - 1) / (count - 1) : 0);
-    const guided = state.quiz.quizMode === "guided";
 
-    // MCQs are always shown at their true slice (the question is about the
-    // spot, not finding it), so their hint always shows; label/pin hints
-    // only show in guided exports.
-    state.targets.forEach((t) => {
-      if (t.type !== "mcq" && !guided) return;
-      const tick = document.createElement("div");
-      tick.className = "tick" + (t.id === state.selectedId ? " active" : "");
-      tick.style.left = `${fracFor(t.sliceIndex) * 100}%`;
-      hintTicksEl.appendChild(tick);
-    });
+    const t = currentTarget();
+    if (t && (t.type === "mcq" || isDone(t) || hintLevel(t) >= 1)) {
+      hintTicksEl.appendChild(rangeTick(t.sliceFrom, t.sliceTo, count, true));
+    }
 
-    const placedSlices = new Set(state.targets.filter((t) => t.type !== "mcq" && t.studentAnswer).map((t) => t.studentAnswer.sliceIndex));
-    placedSlices.forEach((idx) => {
-      const tick = document.createElement("div");
-      tick.className = "tick";
-      tick.style.left = `${fracFor(idx) * 100}%`;
-      mineTicksEl.appendChild(tick);
-    });
+    const placed = new Set(state.targets.filter((x) => x.type !== "mcq" && x.placement).map((x) => x.placement.sliceIndex));
+    placed.forEach((idx) => mineTicksEl.appendChild(rangeTick(idx, idx, count, false)));
   }
 
-  // --- markers -----------------------------------------------------------------
-
-  function toleranceShapeMarkup(t, size, isSelected) {
-    const tol = t.tolerance || DEFAULT_TOLERANCE;
-    const cls = isSelected ? "tolerance selected" : "tolerance";
-    if (tol.mode === "polygon" && tol.polygon && tol.polygon.length >= 3) {
-      const pts = tol.polygon.map((p) => `${(p.x * size).toFixed(1)},${(p.y * size).toFixed(1)}`).join(" ");
-      return `<polygon class="${cls}" points="${pts}" />`;
-    }
-    const r = (tol.radius ?? DEFAULT_TOLERANCE.radius) * size;
-    return `<circle class="${cls}" cx="${(t.x * size).toFixed(1)}" cy="${(t.y * size).toFixed(1)}" r="${r.toFixed(1)}" />`;
+  function rangeTick(from, to, count, active) {
+    const tick = document.createElement("div");
+    const left = sliderFraction(from, count) * 100;
+    const right = sliderFraction(to, count) * 100;
+    tick.className = "tick range" + (active ? " active" : "");
+    tick.style.left = `calc(${left}% - 3px)`;
+    tick.style.width = `calc(${Math.max(0, right - left)}% + 6px)`;
+    return tick;
   }
 
   function renderToleranceOverlay() {
-    if (!state.quiz) return;
+    if (!state.quiz) {
+      toleranceLayer.innerHTML = "";
+      return;
+    }
     const size = state.manifest.size;
     const parts = [];
-
-    if (state.quiz.exportMode === "quiz" && state.checked) {
-      state.targets.forEach((t) => {
-        // MCQs are always shown at their true spot (see renderMarkers) -
-        // no separate reveal/tolerance zone needed for them.
-        if (t.type === "mcq" || t.sliceIndex !== state.currentIndex) return;
-        parts.push(toleranceShapeMarkup(t, size, t.id === state.selectedId));
-        parts.push(`<circle class="reveal-dot" cx="${(t.x * size).toFixed(1)}" cy="${(t.y * size).toFixed(1)}" r="5" />`);
-      });
+    const t = currentTarget();
+    if (t && t.type !== "mcq" && appliesToSlice(t, state.currentIndex) && (isDone(t) || hintLevel(t) >= 2)) {
+      const zone = zoneFor(t, state.currentIndex);
+      parts.push(toleranceShapeMarkup(zone, size, "tolerance reveal"));
+      if (isDone(t)) parts.push(`<circle class="reveal-dot" cx="${(zone.x * size).toFixed(1)}" cy="${(zone.y * size).toFixed(1)}" r="5" />`);
     }
-
     toleranceLayer.innerHTML = parts.join("");
-  }
-
-  function iconHtmlFor(type, extraClass) {
-    const cls = extraClass ? ` ${extraClass}` : "";
-    if (type === "label") return `<span class="icon label${cls}"></span>`;
-    if (type === "pin") return `<span class="icon pin${cls}">i</span>`;
-    return `<span class="icon mcq${cls}">?</span>`;
   }
 
   function renderMarkers() {
@@ -328,75 +422,82 @@
     if (!state.quiz) return;
 
     if (state.quiz.exportMode === "showcase") {
-      state.targets.filter((t) => t.sliceIndex === state.currentIndex).forEach((t) => {
+      state.targets.filter((t) => appliesToSlice(t, state.currentIndex)).forEach((t) => {
         markerLayer.appendChild(buildShowcaseMarkerEl(t));
       });
       return;
     }
 
+    const current = currentTarget();
     state.targets.forEach((t) => {
       // MCQs ask about a specific spot rather than testing whether the
-      // student can find it, so they're always shown at their true
-      // location/slice - the student's job is just to pick the right
-      // answer, not to place a marker.
+      // student can find it, so they're always shown at their true location.
       if (t.type === "mcq") {
-        if (t.sliceIndex === state.currentIndex) markerLayer.appendChild(buildMcqMarkerEl(t));
+        if (appliesToSlice(t, state.currentIndex)) markerLayer.appendChild(buildMcqMarkerEl(t, t === current));
         return;
       }
-      if (t.studentAnswer && t.studentAnswer.sliceIndex === state.currentIndex) {
-        markerLayer.appendChild(buildGuessMarkerEl(t));
+      if (t.placement && t.placement.sliceIndex === state.currentIndex) {
+        markerLayer.appendChild(buildGuessMarkerEl(t, t === current));
       }
     });
   }
 
-  function buildMcqMarkerEl(t) {
+  function markerInner(t, glyph) {
+    if (t.type === "label") return `<span class="dot"></span><span class="chip">${escapeHtml(t.text || "")}</span>`;
+    return `<span class="icon-circle">${glyph || (t.type === "pin" ? "i" : "?")}</span>`;
+  }
+
+  function outcomeClass(t) {
+    if (t.status === "correct") return " outcome-correct";
+    if (t.status === "revealed") return " outcome-incorrect";
+    if (t.lastResult && !t.lastResult.correct) return " outcome-incorrect";
+    return "";
+  }
+
+  function buildMcqMarkerEl(t, isCurrent) {
+    const zone = zoneFor(t, state.currentIndex);
     const div = document.createElement("div");
-    const outcomeCls = t.outcome ? ` outcome-${t.outcome}` : t.studentChoice ? " outcome-pending" : "";
-    div.className = `marker mcq-fixed${outcomeCls}` + (t.id === state.selectedId ? " selected" : "");
-    div.style.left = `${t.x * 100}%`;
-    div.style.top = `${t.y * 100}%`;
+    const pending = !t.status.match(/correct|revealed/) && t.choice && !(t.lastResult && !t.lastResult.correct) ? " outcome-pending" : "";
+    div.className = `marker mcq-fixed${outcomeClass(t)}${pending}` + (isCurrent ? " selected" : "");
+    div.style.left = `${zone.x * 100}%`;
+    div.style.top = `${zone.y * 100}%`;
     div.title = t.question || "MCQ";
-    div.innerHTML = `<span class="icon-circle">?</span>`;
+    div.innerHTML = markerInner(t, "?");
     div.addEventListener("click", (e) => {
       e.stopPropagation();
-      selectTarget(t.id);
+      if (state.phase !== "start") goToItem(t.id);
     });
     return div;
   }
 
   function buildShowcaseMarkerEl(t) {
+    const zone = zoneFor(t, state.currentIndex);
     const div = document.createElement("div");
-    div.className = `marker showcase ${t.type}` + (t.id === state.selectedId ? " selected" : "");
-    div.style.left = `${t.x * 100}%`;
-    div.style.top = `${t.y * 100}%`;
-    if (t.type === "label") {
-      div.innerHTML = `<span class="dot"></span><span class="chip">${escapeHtml(t.text || "")}</span>`;
-    } else if (t.type === "pin") {
-      div.title = t.title || "Pin";
-      div.innerHTML = `<span class="icon-circle">i</span>`;
-    } else {
-      div.title = t.question || "MCQ";
-      div.innerHTML = `<span class="icon-circle">?</span>`;
-    }
+    div.className = `marker showcase ${t.type}` + (t.id === state.currentId ? " selected" : "");
+    div.style.left = `${zone.x * 100}%`;
+    div.style.top = `${zone.y * 100}%`;
+    if (t.type !== "label") div.title = summaryFor(t);
+    div.innerHTML = markerInner(t);
     div.addEventListener("click", (e) => {
       e.stopPropagation();
-      selectTarget(t.id);
+      state.currentId = t.id;
+      renderAll();
     });
     return div;
   }
 
-  function buildGuessMarkerEl(t) {
+  function buildGuessMarkerEl(t, isCurrent) {
     const div = document.createElement("div");
-    const outcomeCls = t.outcome ? ` outcome-${t.outcome}` : "";
-    div.className = `marker mine ${t.type}${outcomeCls}` + (t.id === state.selectedId ? " selected" : "");
-    div.style.left = `${t.studentAnswer.x * 100}%`;
-    div.style.top = `${t.studentAnswer.y * 100}%`;
-    if (t.type === "label") {
-      div.innerHTML = `<span class="dot"></span><span class="chip">${escapeHtml(t.text || "")}</span>`;
+    const locked = isDone(t);
+    div.className = `marker mine ${t.type}${outcomeClass(t)}` + (isCurrent ? " selected" : "") + (locked ? " locked" : "");
+    div.style.left = `${t.placement.x * 100}%`;
+    div.style.top = `${t.placement.y * 100}%`;
+    div.innerHTML = markerInner(t);
+    if (locked) {
+      div.addEventListener("click", (e) => { e.stopPropagation(); goToItem(t.id); });
     } else {
-      div.innerHTML = `<span class="icon-circle">${t.type === "mcq" ? "?" : "i"}</span>`;
+      wireGuessDrag(div, t);
     }
-    wireGuessDrag(div, t);
     return div;
   }
 
@@ -405,15 +506,13 @@
       e.preventDefault();
       div.setPointerCapture(e.pointerId);
       let dragging = false;
-      let pendingX = t.studentAnswer.x;
-      let pendingY = t.studentAnswer.y;
+      let pendingX = t.placement.x;
+      let pendingY = t.placement.y;
       const startX = e.clientX;
       const startY = e.clientY;
 
       const onMove = (moveEvt) => {
-        const dx = moveEvt.clientX - startX;
-        const dy = moveEvt.clientY - startY;
-        if (!dragging && Math.hypot(dx, dy) > 8) dragging = true;
+        if (!dragging && Math.hypot(moveEvt.clientX - startX, moveEvt.clientY - startY) > 8) dragging = true;
         if (!dragging) return;
         const rect = stage.getBoundingClientRect();
         pendingX = clamp((moveEvt.clientX - rect.left) / rect.width, 0, 1);
@@ -421,50 +520,31 @@
         div.style.left = `${pendingX * 100}%`;
         div.style.top = `${pendingY * 100}%`;
       };
-
       const onUp = () => {
         div.removeEventListener("pointermove", onMove);
         if (dragging) {
-          t.studentAnswer.x = pendingX;
-          t.studentAnswer.y = pendingY;
-          t.outcome = null;
-          renderTicks();
-          renderTargetsList();
-          renderInspector();
-          renderMarkers();
-          renderToleranceOverlay();
+          t.placement.x = pendingX;
+          t.placement.y = pendingY;
+          t.lastResult = null;
+          if (state.currentId !== t.id) state.currentId = t.id;
+          saveProgress();
+          renderAll();
         } else {
-          selectTarget(t.id);
+          goToItem(t.id);
         }
       };
-
       div.addEventListener("pointermove", onMove);
       div.addEventListener("pointerup", onUp, { once: true });
     });
   }
 
-  // --- showcase list -------------------------------------------------------
-
-  function summaryFor(t) {
-    if (t.type === "label") return t.text || "(empty label)";
-    if (t.type === "pin") return t.title || "(untitled pin)";
-    return t.question || "(untitled question)";
-  }
-
-  function sortAnnotations(list, order) {
-    const copy = list.slice();
-    if (order === "type") return copy.sort((a, b) => TYPE_LABELS[a.type].localeCompare(TYPE_LABELS[b.type]) || a.sliceIndex - b.sliceIndex);
-    if (order === "title-asc") return copy.sort((a, b) => summaryFor(a).localeCompare(summaryFor(b)));
-    if (order === "title-desc") return copy.sort((a, b) => summaryFor(b).localeCompare(summaryFor(a)));
-    return copy.sort((a, b) => a.sliceIndex - b.sliceIndex);
-  }
+  // --- showcase list -------------------------------------------------------------------------
 
   function renderShowcaseList() {
     if (!state.quiz || state.quiz.exportMode !== "showcase") return;
     totalAnnCountEl.textContent = state.targets.length;
     const sorted = sortAnnotations(state.targets, sortOrderEl.value);
     showcaseListEl.innerHTML = "";
-
     if (!sorted.length) {
       const li = document.createElement("li");
       li.className = "empty";
@@ -472,356 +552,281 @@
       showcaseListEl.appendChild(li);
       return;
     }
-
     sorted.forEach((t) => {
       const li = document.createElement("li");
-      if (t.id === state.selectedId) li.classList.add("active");
+      if (t.id === state.currentId) li.classList.add("active");
       li.innerHTML = `
         ${iconHtmlFor(t.type)}
         <span class="label-text">${escapeHtml(summaryFor(t))}</span>
-        <span class="slice-tag">#${t.sliceIndex}</span>
-      `;
-      li.addEventListener("click", () => navigateToShowcaseItem(t.id));
+        <span class="slice-tag">#${rangeLabel(t)}</span>`;
+      li.addEventListener("click", async () => {
+        state.player.stop();
+        if (!appliesToSlice(t, state.currentIndex)) await loadSlice(t.sliceFrom);
+        state.currentId = t.id;
+        renderAll();
+      });
       showcaseListEl.appendChild(li);
     });
   }
 
-  async function navigateToShowcaseItem(id) {
-    const t = state.targets.find((x) => x.id === id);
-    if (!t) return;
-    stopPlaying();
-    if (t.sliceIndex !== state.currentIndex) await loadSlice(t.sliceIndex);
-    selectTarget(id);
-  }
-
-  // --- quiz targets list -----------------------------------------------------
+  // --- quiz progress list -----------------------------------------------------------------------
 
   function statusClassFor(t) {
-    if (t.outcome === "correct") return "correct";
-    if (t.outcome === "incorrect") return "incorrect";
-    if (isAttempted(t)) return "placed";
-    return "unplaced";
+    if (t.status === "correct") return "correct";
+    if (t.status === "revealed") return "revealed";
+    if (t.placement || t.choice) return "attempted";
+    if (t.skipped) return "skipped";
+    return "todo";
+  }
+
+  function statusTextFor(t) {
+    return { correct: "correct", revealed: "shown", attempted: "attempted", skipped: "skipped", todo: "not started" }[statusClassFor(t)];
   }
 
   function renderTargetsList() {
     if (!state.quiz || state.quiz.exportMode !== "quiz") return;
-    targetsCountEl.textContent = state.targets.length;
+    const done = state.targets.filter(isDone).length;
+    progressCountEl.textContent = `${done} / ${state.targets.length}`;
     targetsListEl.innerHTML = "";
+    const locked = state.phase === "start";
+    targetsListEl.classList.toggle("locked", locked);
 
-    state.targets.forEach((t) => {
+    state.targets.forEach((t, i) => {
       const li = document.createElement("li");
       li.dataset.id = t.id;
-      if (t.id === state.selectedId) li.classList.add("active");
-      if (t.id === state.armedId) li.classList.add("armed");
+      if (t.id === state.currentId) li.classList.add("current");
+      if (locked) li.classList.add("locked");
+      li.setAttribute("aria-label", `Item ${i + 1}: ${summaryFor(t)}, ${statusTextFor(t)}`);
       li.innerHTML = `
-        <span class="status-icon ${statusClassFor(t)}"></span>
+        <span class="status-icon ${statusClassFor(t)}" aria-hidden="true"></span>
         <span class="label-text">${escapeHtml(summaryFor(t))}</span>
-      `;
+        ${t.tries ? `<span class="tries" title="Wrong attempts">${t.tries}✕</span>` : ""}`;
+      if (!locked) li.addEventListener("click", () => goToItem(t.id));
       targetsListEl.appendChild(li);
     });
+    summaryBtn.disabled = locked;
+    restartBtn.disabled = locked;
   }
 
-  // Only reached for unplaced items (placed items navigate via the plain
-  // "click" listener in wireGlobalControls instead) - a tap arms the item
-  // for tap-to-place.
-  function onTargetListClick(id) {
-    setArmed(state.armedId === id ? null : id);
-    selectTarget(id);
-  }
-
-  async function navigateToTarget(id) {
-    const t = state.targets.find((x) => x.id === id);
-    if (!t) return;
-    stopPlaying();
-    setArmed(null);
-    // MCQs are always shown at their true slice; other types navigate to
-    // wherever the student placed their guess (if anywhere).
-    const targetSlice = t.type === "mcq" ? t.sliceIndex : t.studentAnswer && t.studentAnswer.sliceIndex;
-    if (targetSlice && targetSlice !== state.currentIndex) {
-      await loadSlice(targetSlice);
-    }
-    selectTarget(id);
-  }
-
-  // --- selection / arming ------------------------------------------------------
-
-  function setArmed(id) {
-    state.armedId = id;
-    stage.classList.toggle("armed-mode", !!id);
-    renderTargetsList();
-  }
-
-  function selectTarget(id) {
-    state.selectedId = id;
-    renderInspector();
-    renderMarkers();
-    renderToleranceOverlay();
-    if (state.quiz.exportMode === "showcase") renderShowcaseList();
-    else { renderTargetsList(); renderTicks(); }
-  }
-
-  function deselect() {
-    if (!state.selectedId && !state.armedId) return;
-    state.selectedId = null;
-    setArmed(null);
-    renderInspector();
-    renderMarkers();
-    renderToleranceOverlay();
-    if (state.quiz && state.quiz.exportMode === "showcase") renderShowcaseList();
-    else if (state.quiz) renderTicks();
-  }
-
-  function placeGuess(id, clientX, clientY, rect) {
-    const t = state.targets.find((x) => x.id === id);
-    if (!t) return;
-    const x = clamp((clientX - rect.left) / rect.width, 0, 1);
-    const y = clamp((clientY - rect.top) / rect.height, 0, 1);
-    t.studentAnswer = { sliceIndex: state.currentIndex, x, y };
-    t.outcome = null;
-    setArmed(null);
-    selectTarget(id);
-    renderTicks();
-  }
-
-  // --- inspector -----------------------------------------------------------
+  // --- inspector ------------------------------------------------------------------------------------
 
   function renderInspector() {
     if (!state.quiz) return;
-    const t = state.targets.find((x) => x.id === state.selectedId);
-    if (!t) {
-      inspectorEl.innerHTML = state.quiz.exportMode === "showcase"
-        ? `<p class="hint placeholder">Select an annotation to see its details.</p>`
-        : `<p class="hint placeholder">Select an item on the left to see what to place, or tap a placed marker to review it.</p>`;
+    if (state.quiz.exportMode === "showcase") {
+      const t = findTarget(state.currentId);
+      inspectorEl.innerHTML = t ? buildShowcaseInspector(t) : `<p class="hint placeholder">Select an annotation to see its details.</p>`;
+      if (t) el("closeInspector").addEventListener("click", () => { state.currentId = null; renderAll(); });
       return;
     }
-    inspectorEl.innerHTML = state.quiz.exportMode === "showcase" ? buildShowcaseInspector(t) : buildQuizInspector(t);
-    wireInspector(t);
+    if (state.phase === "start") {
+      inspectorEl.innerHTML = buildStartScreen();
+      el("startBtn").addEventListener("click", startQuiz);
+      return;
+    }
+    if (state.phase === "summary") {
+      inspectorEl.innerHTML = buildSummary();
+      inspectorEl.querySelectorAll("[data-retry]").forEach((b) => b.addEventListener("click", () => retryItem(b.dataset.retry)));
+      const resume = el("resumeBtn");
+      if (resume) resume.addEventListener("click", () => goToItem(nextTodo(null).id));
+      el("summaryRestartBtn").addEventListener("click", restartQuiz);
+      return;
+    }
+    const t = currentTarget();
+    if (!t) {
+      inspectorEl.innerHTML = `<p class="hint placeholder">Pick an item from the list to work on it.</p>`;
+      return;
+    }
+    inspectorEl.innerHTML = buildItemInspector(t);
+    wireItemInspector(t);
+  }
+
+  function buildStartScreen() {
+    const n = state.targets.length;
+    const placeN = state.targets.filter((t) => t.type !== "mcq").length;
+    const mcqN = n - placeN;
+    const guided = state.quiz.quizMode === "guided";
+    return `
+      <div class="intro">
+        <h2 style="margin:0;font-size:1.05rem">Ready?</h2>
+        <p style="margin:0">This quiz has <strong>${n} item${n === 1 ? "" : "s"}</strong>${mcqN ? ` (${placeN} to place, ${mcqN} question${mcqN === 1 ? "" : "s"})` : ""}. You'll work through them one at a time.</p>
+        <ul>
+          ${placeN ? `<li>Scrub through the slices with the slider, then tap the slice where the feature belongs. Drag your marker to adjust it before you check.</li>` : ""}
+          ${guided && placeN ? `<li>A highlight under the slider shows which slices the current feature is on.</li>` : placeN ? `<li>If you miss, you'll get a hint about where to look.</li>` : ""}
+          ${mcqN ? `<li>Questions are already placed on the slice; open one and choose an answer.</li>` : ""}
+          <li>You can skip an item and come back to it. Your progress is saved in this browser.</li>
+        </ul>
+        <button type="button" id="startBtn" class="primary">${state.targets.some((t) => t.placement || t.choice || isDone(t)) ? "Continue" : "Start"}</button>
+      </div>`;
+  }
+
+  function buildItemInspector(t) {
+    const index = state.targets.indexOf(t) + 1;
+    const header = `
+      <div class="inspector-header">
+        <p class="step">Item ${index} of ${state.targets.length} · ${TYPE_LABELS[t.type]}</p>
+      </div>
+      <p class="prompt">${escapeHtml(summaryFor(t))}</p>`;
+
+    let body;
+    if (t.type === "mcq") {
+      body = `
+        <p class="meta">On slice${isMultiSlice(t) ? "s" : ""} ${rangeLabel(t)} — already placed for you at the ? marker.</p>
+        <div class="mcq-options" role="radiogroup" aria-label="Your answer">
+          ${(t.options || []).map((o, i) => `
+            <label><input type="radio" name="choice" value="${escapeHtml(o)}" ${o === t.choice ? "checked" : ""} ${isDone(t) ? "disabled" : ""} /> <span>${escapeHtml(o)}</span></label>`).join("")}
+        </div>`;
+    } else if (t.placement) {
+      body = `<p class="meta">Your marker is on slice ${t.placement.sliceIndex}${t.placement.sliceIndex !== state.currentIndex ? ` (<button type="button" class="linklike" id="gotoPlacementBtn">show</button>)` : ""}.${isDone(t) ? "" : " Drag it to adjust."}</p>`;
+    } else {
+      body = `<p class="hint">Scrub to the slice you think this is on, then tap the spot.</p>`;
+    }
+
+    const level = hintLevel(t);
+    let hintBlock = "";
+    if (!isDone(t) && t.type !== "mcq" && level >= 1) {
+      hintBlock = `<p class="hint">Hint: it's on slice${isMultiSlice(t) ? "s" : ""} <strong>${rangeLabel(t)}</strong>${level >= 2 ? ", and the accepted zone is now outlined on those slices" : ""}.</p>`;
+    }
+
+    let outcome = "";
+    if (t.status === "correct") {
+      outcome = `<div class="outcome-banner correct">Correct!${t.tries ? `<span class="sub">Took ${t.tries + 1} tries.</span>` : ""}</div>${revealBlock(t)}`;
+    } else if (t.status === "revealed") {
+      outcome = `<div class="outcome-banner incorrect">Here's where it is.<span class="sub">Marked as shown, not solved. You can retry it from the summary.</span></div>${revealBlock(t)}`;
+    } else if (t.lastResult && !t.lastResult.correct) {
+      outcome = `<div class="outcome-banner incorrect">Not right yet.<span class="sub">${missExplanation(t)}</span></div>`;
+    }
+
+    const actions = [];
+    if (!isDone(t)) {
+      if (t.type === "mcq") actions.push(`<button type="button" id="checkBtn" class="primary" ${t.choice ? "" : "disabled"}>Check answer</button>`);
+      else {
+        actions.push(`<button type="button" id="checkBtn" class="primary" ${t.placement ? "" : "disabled"}>Check placement</button>`);
+        if (t.placement) actions.push(`<button type="button" id="clearBtn">Clear marker</button>`);
+      }
+      if (canShowMe(t)) actions.push(`<button type="button" id="showMeBtn">Show me</button>`);
+      actions.push(`<button type="button" id="skipBtn">Skip</button>`);
+    } else {
+      actions.push(`<button type="button" id="nextBtn" class="primary">${nextTodo(t.id) ? "Next" : "Finish"}</button>`);
+    }
+
+    return `${header}${body}${hintBlock}${outcome}<div class="inspector-section btn-row">${actions.join("")}</div>`;
+  }
+
+  function missExplanation(t) {
+    const r = t.lastResult.reason;
+    if (t.type === "mcq") return "Try another answer.";
+    if (r === "slice") {
+      return hintLevel(t) >= 1
+        ? `Your marker is on slice ${t.placement.sliceIndex}; the feature is on slice${isMultiSlice(t) ? "s" : ""} ${rangeLabel(t)}.`
+        : "It's not on this slice. Scrub to a different one and try again.";
+    }
+    return "Right slice, but not the right spot. Move your marker and check again.";
+  }
+
+  function revealBlock(t) {
+    if (t.type === "mcq") return `<div class="inspector-section"><h3 class="section-title">Answer</h3><p style="margin:0"><strong>${escapeHtml(t.answer || "")}</strong></p></div>`;
+    if (t.type === "pin") return `<div class="inspector-section"><h3 class="section-title">About this feature</h3><p style="margin:0;font-size:0.88rem;line-height:1.45">${escapeHtml(t.description || "")}</p></div>`;
+    return "";
+  }
+
+  function buildSummary() {
+    const total = state.targets.length;
+    const correct = state.targets.filter((t) => t.status === "correct").length;
+    const remaining = state.targets.filter((t) => !isDone(t)).length;
+    const rows = state.targets.map((t, i) => `
+      <li>
+        <span class="status-icon ${statusClassFor(t)}" aria-hidden="true"></span>
+        <span class="label-text" title="${escapeHtml(summaryFor(t))}">${i + 1}. ${escapeHtml(summaryFor(t))}</span>
+        <span class="tries">${t.status === "correct" ? `${t.tries + 1} tr${t.tries === 0 ? "y" : "ies"}` : t.status === "revealed" ? "shown" : t.skipped ? "skipped" : "open"}</span>
+        <button type="button" data-retry="${escapeHtml(t.id)}">${isDone(t) ? "Retry" : "Go"}</button>
+      </li>`).join("");
+    return `
+      <div class="inspector-header"><h2>Summary</h2></div>
+      <p class="summary-total">${correct} of ${total} correct${remaining ? ` · ${remaining} still open` : ""}</p>
+      <ul class="summary-list">${rows}</ul>
+      <div class="inspector-section btn-row">
+        ${remaining ? `<button type="button" id="resumeBtn" class="primary">Continue</button>` : ""}
+        <button type="button" id="summaryRestartBtn" class="danger">Start over</button>
+      </div>`;
   }
 
   function buildShowcaseInspector(t) {
     const header = `
-      <div class="inspector-header"><h2>${TYPE_LABELS[t.type]}</h2><button id="closeInspector" title="Close">×</button></div>
-      <p class="meta">Slice ${t.sliceIndex} · layer: ${escapeHtml(t.layer || "unassigned")}</p>`;
+      <div class="inspector-header"><h2>${TYPE_LABELS[t.type]}</h2><button type="button" id="closeInspector" title="Close" aria-label="Close">×</button></div>
+      <p class="meta">Slice${isMultiSlice(t) ? "s" : ""} ${rangeLabel(t)} · layer: ${escapeHtml(t.layer || "unassigned")}</p>`;
     if (t.type === "label") return `${header}<p class="prompt">${escapeHtml(t.text || "")}</p>`;
     if (t.type === "pin") {
-      return `${header}<p class="prompt">${escapeHtml(t.title || "")}</p><p>${escapeHtml(t.description || "")}</p>`;
+      return `${header}<p class="prompt">${escapeHtml(t.title || "")}</p><p style="margin:0;font-size:0.88rem;line-height:1.45">${escapeHtml(t.description || "")}</p>`;
     }
     const options = (t.options || []).map((o) => `<li class="${o === t.answer ? "correct-answer" : ""}">${escapeHtml(o)}</li>`).join("");
     return `${header}<p class="prompt">${escapeHtml(t.question || "")}</p><ul class="options-list">${options}</ul>`;
   }
 
-  function buildQuizInspector(t) {
-    const header = `<div class="inspector-header"><h2>${TYPE_LABELS[t.type]}</h2><button id="closeInspector" title="Close">×</button></div>`;
-    const prompt = `<p class="prompt">${escapeHtml(summaryFor(t))}</p>`;
-
-    if (t.type === "mcq") {
-      const opts = (t.options || []).map((o) => `<option value="${escapeHtml(o)}" ${o === t.studentChoice ? "selected" : ""}>${escapeHtml(o)}</option>`).join("");
-      const mcqBlock = `<p class="meta">On slice ${t.sliceIndex} — already placed for you.</p>` +
-        `<label>Your answer<select id="f-choice"><option value="">Choose…</option>${opts}</select></label>`;
-
-      let outcomeBlock = "";
-      if (state.checked) {
-        const attempted = isAttempted(t);
-        const cls = t.outcome === "correct" ? "correct" : attempted ? "incorrect" : "pending";
-        const text = t.outcome === "correct" ? "Correct!" : attempted ? "Not quite" : "Not attempted";
-        outcomeBlock = `<div class="outcome-banner ${cls}">${text}</div>`;
-        if (attempted) {
-          outcomeBlock += `<div class="reveal-section"><h3>Reveal</h3><p>Correct answer: <strong>${escapeHtml(t.answer || "")}</strong></p></div>`;
-        }
-      }
-      return `${header}${prompt}${mcqBlock}${outcomeBlock}`;
-    }
-
-    let placementBlock;
-    if (t.studentAnswer) {
-      placementBlock = `<p class="meta">Your placement: slice ${t.studentAnswer.sliceIndex}</p><button id="clearPlacementBtn">Clear placement</button>`;
-    } else {
-      placementBlock = `<p class="hint">Tap the slice where you think this belongs.</p>`;
-    }
-
-    let outcomeBlock = "";
-    if (state.checked) {
-      const attempted = isAttempted(t);
-      const cls = t.outcome === "correct" ? "correct" : attempted ? "incorrect" : "pending";
-      const text = t.outcome === "correct" ? "Correct!" : attempted ? "Not quite" : "Not attempted";
-      outcomeBlock = `<div class="outcome-banner ${cls}">${text}</div>`;
-      if (attempted) {
-        let reveal = `<p class="meta">Correct slice: ${t.sliceIndex}</p>`;
-        if (t.type === "pin") reveal += `<p>${escapeHtml(t.description || "")}</p>`;
-        outcomeBlock += `<div class="reveal-section"><h3>Reveal</h3>${reveal}</div>`;
-      }
-    }
-
-    return `${header}${prompt}${placementBlock}${outcomeBlock}`;
-  }
-
-  function wireInspector(t) {
-    el("closeInspector").addEventListener("click", deselect);
-
-    const choiceSel = el("f-choice");
-    if (choiceSel) {
-      choiceSel.addEventListener("change", () => {
-        t.studentChoice = choiceSel.value || null;
-        t.outcome = null;
-        renderTargetsList();
-        renderMarkers();
+  function wireItemInspector(t) {
+    inspectorEl.querySelectorAll('input[name="choice"]').forEach((radio) => {
+      radio.addEventListener("change", () => {
+        if (!radio.checked) return;
+        t.choice = radio.value;
+        t.lastResult = null;
+        saveProgress();
+        renderAll();
       });
+    });
+    const on = (id, fn) => { const b = el(id); if (b) b.addEventListener("click", fn); };
+    on("checkBtn", checkCurrent);
+    on("clearBtn", () => { t.placement = null; t.lastResult = null; saveProgress(); renderAll(); });
+    on("showMeBtn", revealCurrent);
+    on("skipBtn", skipCurrent);
+    on("nextBtn", advance);
+    on("gotoPlacementBtn", () => loadSlice(t.placement.sliceIndex));
+  }
+
+  // --- import ------------------------------------------------------------------------------------
+
+  async function importAnnotationsFile(file) {
+    let text;
+    let data;
+    try {
+      text = await file.text();
+      data = JSON.parse(text);
+    } catch {
+      S.notify("error", `Could not import ${file.name}: the file is not valid JSON.`, { id: "import" });
+      return;
     }
-
-    const clearBtn = el("clearPlacementBtn");
-    if (clearBtn) {
-      clearBtn.addEventListener("click", () => {
-        t.studentAnswer = null;
-        t.outcome = null;
-        renderTargetsList();
-        renderTicks();
-        renderMarkers();
-        renderToleranceOverlay();
-        renderInspector();
-      });
+    const parsed = S.parseExportFile(data, state.manifest.sliceCount);
+    if (parsed.error) {
+      S.notify("error", `Could not import ${file.name}: ${parsed.error}.`, { id: "import" });
+      return;
     }
+    S.dismissNotice("import");
+    S.dismissNotice("load");
+    await loadQuizData(parsed.file, text, file.name);
   }
 
-  // --- placement interaction: drag from list, or tap-to-arm/tap-to-place -----
-
-  function createGhost(text) {
-    const ghost = document.createElement("div");
-    ghost.className = "drag-ghost";
-    ghost.textContent = text;
-    document.body.appendChild(ghost);
-    return ghost;
-  }
-
-  function positionGhost(ghost, x, y) {
-    ghost.style.left = `${x}px`;
-    ghost.style.top = `${y}px`;
-  }
-
-  function beginTargetInteraction(li, downEvent, t) {
-    if (t.studentAnswer) return; // already placed - list click handles navigation instead
-    const startX = downEvent.clientX;
-    const startY = downEvent.clientY;
-    let dragging = false;
-    let ghost = null;
-
-    li.setPointerCapture(downEvent.pointerId);
-
-    const cleanup = () => {
-      li.removeEventListener("pointermove", onMove);
-      li.removeEventListener("pointerup", onUp);
-      li.removeEventListener("pointercancel", onCancel);
-      stage.classList.remove("drag-over");
-      if (ghost) ghost.remove();
-    };
-
-    const onMove = (e) => {
-      const dx = e.clientX - startX;
-      const dy = e.clientY - startY;
-      if (!dragging && Math.hypot(dx, dy) > 10) {
-        dragging = true;
-        ghost = createGhost(summaryFor(t));
-      }
-      if (!dragging) return;
-      positionGhost(ghost, e.clientX, e.clientY);
-      stage.classList.toggle("drag-over", isPointInRect(e.clientX, e.clientY, stage.getBoundingClientRect()));
-    };
-
-    const onUp = (e) => {
-      cleanup();
-      if (dragging) {
-        const rect = stage.getBoundingClientRect();
-        if (isPointInRect(e.clientX, e.clientY, rect)) placeGuess(t.id, e.clientX, e.clientY, rect);
-      } else {
-        onTargetListClick(t.id);
-      }
-    };
-    const onCancel = () => cleanup();
-
-    li.addEventListener("pointermove", onMove);
-    li.addEventListener("pointerup", onUp);
-    li.addEventListener("pointercancel", onCancel);
-  }
-
-  // --- global wiring -----------------------------------------------------------
+  // --- global wiring -----------------------------------------------------------------------------
 
   function wireGlobalControls() {
     scrub.addEventListener("input", () => {
-      stopPlaying();
-      loadSlice(Number(scrub.value)).then(renderTicks);
+      state.player.stop();
+      loadSlice(Number(scrub.value));
     });
-
-    playBtn.addEventListener("click", () => {
-      if (state.playing) {
-        stopPlaying();
-        return;
-      }
-      state.playing = true;
-      playBtn.textContent = "Pause";
-      state.playTimer = setInterval(() => {
-        let next = state.currentIndex + 1;
-        if (next > state.manifest.sliceCount) next = 1;
-        loadSlice(next).then(renderTicks);
-      }, 300);
-    });
+    playBtn.addEventListener("click", () => state.player.toggle());
 
     stage.addEventListener("click", (e) => {
-      if (!state.quiz || state.quiz.exportMode !== "quiz") return;
-      if (state.armedId) {
-        if (e.target.closest(".marker")) return;
-        const rect = stage.getBoundingClientRect();
-        placeGuess(state.armedId, e.clientX, e.clientY, rect);
-        return;
-      }
-      if (state.selectedId && !e.target.closest(".marker")) deselect();
-    });
-
-    // MCQs and already-placed items just navigate on a plain click (no
-    // drag needed - MCQs are always shown at their true spot, and
-    // repositioning a placed guess happens via its marker on the stage
-    // instead). Unplaced label/pin items go through the pointerdown-based
-    // drag-or-arm interaction below; splitting on this avoids both
-    // mechanisms firing for the same tap.
-    targetsListEl.addEventListener("click", (e) => {
-      const li = e.target.closest("li[data-id]");
-      if (!li) return;
-      const t = state.targets.find((x) => x.id === li.dataset.id);
-      if (t && (t.type === "mcq" || t.studentAnswer)) navigateToTarget(t.id);
-    });
-
-    targetsListEl.addEventListener("pointerdown", (e) => {
-      const li = e.target.closest("li[data-id]");
-      if (!li) return;
-      const t = state.targets.find((x) => x.id === li.dataset.id);
-      if (!t || t.type === "mcq" || t.studentAnswer) return;
-      if (e.pointerType === "mouse" && e.button !== 0) return;
-      e.preventDefault();
-      beginTargetInteraction(li, e, t);
+      if (e.target.closest(".marker")) return;
+      const t = currentTarget();
+      if (t && t.type !== "mcq" && !isDone(t)) placeCurrent(e.clientX, e.clientY, stage.getBoundingClientRect());
     });
 
     sortOrderEl.addEventListener("change", renderShowcaseList);
-
-    checkBtn.addEventListener("click", checkAnswers);
-    resetBtn.addEventListener("click", resetAttempt);
+    summaryBtn.addEventListener("click", showSummary);
+    restartBtn.addEventListener("click", restartQuiz);
 
     importBtn.addEventListener("click", () => importFile.click());
     importFile.addEventListener("change", async () => {
       const file = importFile.files[0];
-      if (!file) return;
-      try {
-        const parsed = JSON.parse(await file.text());
-        if (!isValidQuizFile(parsed)) throw new Error("Not a valid annotations export");
-        await loadQuizData(parsed);
-      } catch (err) {
-        alert("Could not import file: " + err.message);
-      } finally {
-        importFile.value = "";
-      }
-    });
-
-    document.addEventListener("keydown", (e) => {
-      if (e.key !== "Escape") return;
-      if (state.armedId) setArmed(null);
-      else if (state.selectedId) deselect();
+      if (file) await importAnnotationsFile(file);
+      importFile.value = "";
     });
   }
 
