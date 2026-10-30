@@ -1,0 +1,73 @@
+{
+  "size": 400,
+  "sliceCount": 40,
+  "axis": "height, bottom to top",
+  "layers": [
+    {
+      "id": "skin",
+      "label": "Skin"
+    },
+    {
+      "id": "flesh",
+      "label": "Flesh"
+    },
+    {
+      "id": "core",
+      "label": "Core"
+    },
+    {
+      "id": "seed",
+      "label": "Seed"
+    },
+    {
+      "id": "stem",
+      "label": "Stem"
+    },
+    {
+      "id": "calyx",
+      "label": "Calyx (blossom end)"
+    }
+  ],
+  "files": [
+    "slice-001.svg",
+    "slice-002.svg",
+    "slice-003.svg",
+    "slice-004.svg",
+    "slice-005.svg",
+    "slice-006.svg",
+    "slice-007.svg",
+    "slice-008.svg",
+    "slice-009.svg",
+    "slice-010.svg",
+    "slice-011.svg",
+    "slice-012.svg",
+    "slice-013.svg",
+    "slice-014.svg",
+    "slice-015.svg",
+    "slice-016.svg",
+    "slice-017.svg",
+    "slice-018.svg",
+    "slice-019.svg",
+    "slice-020.svg",
+    "slice-021.svg",
+    "slice-022.svg",
+    "slice-023.svg",
+    "slice-024.svg",
+    "slice-025.svg",
+    "slice-026.svg",
+    "slice-027.svg",
+    "slice-028.svg",
+    "slice-029.svg",
+    "slice-030.svg",
+    "slice-031.svg",
+    "slice-032.svg",
+    "slice-033.svg",
+    "slice-034.svg",
+    "slice-035.svg",
+    "slice-036.svg",
+    "slice-037.svg",
+    "slice-038.svg",
+    "slice-039.svg",
+    "slice-040.svg"
+  ]
+}

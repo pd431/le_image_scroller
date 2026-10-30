@@ -1,0 +1,98 @@
+{
+  "version": 2,
+  "exportMode": "quiz",
+  "quizMode": "guided",
+  "dataset": {
+    "size": 400,
+    "sliceCount": 40,
+    "axis": "height, bottom to top"
+  },
+  "annotations": [
+    {
+      "id": "a-etupxsq3mrf1hx5p",
+      "type": "pin",
+      "sliceIndex": 3,
+      "layer": "calyx",
+      "x": 0.5,
+      "y": 0.5,
+      "tolerance": {
+        "mode": "radius",
+        "radius": 0.06
+      },
+      "title": "Calyx",
+      "description": "The dried remains of the flower at the blossom end of the fruit."
+    },
+    {
+      "id": "a-x865086fmrf1hxma",
+      "type": "label",
+      "sliceIndex": 18,
+      "layer": "core",
+      "x": 0.5,
+      "y": 0.4900486734657805,
+      "tolerance": {
+        "mode": "radius",
+        "radius": 0.06
+      },
+      "text": "Core"
+    },
+    {
+      "id": "a-4lbaru8mmrf1hy24",
+      "type": "pin",
+      "sliceIndex": 20,
+      "layer": "flesh",
+      "x": 0.16431752200579752,
+      "y": 0.5155559557055995,
+      "tolerance": {
+        "mode": "radius",
+        "radius": 0.06
+      },
+      "title": "Flesh",
+      "description": "The soft edible tissue between the skin and the core."
+    },
+    {
+      "id": "a-qzz3nivkmrf1hydm",
+      "type": "label",
+      "sliceIndex": 20,
+      "layer": "skin",
+      "x": 0.5,
+      "y": 0.15620625353506787,
+      "tolerance": {
+        "mode": "radius",
+        "radius": 0.06
+      },
+      "text": "Skin"
+    },
+    {
+      "id": "a-djm5ylfamrf1hytd",
+      "type": "mcq",
+      "sliceIndex": 22,
+      "layer": "core",
+      "x": 0.5,
+      "y": 0.5,
+      "tolerance": {
+        "mode": "radius",
+        "radius": 0.06
+      },
+      "question": "What condition does this point to?",
+      "options": [
+        "Rot",
+        "Bite mark",
+        "Healthy apple"
+      ],
+      "answer": "Healthy apple"
+    },
+    {
+      "id": "a-v8akm2whmrf1hzbf",
+      "type": "label",
+      "sliceIndex": 38,
+      "layer": "stem",
+      "x": 0.5,
+      "y": 0.5,
+      "tolerance": {
+        "mode": "radius",
+        "radius": 0.06
+      },
+      "text": "Stem"
+    }
+  ]
+}

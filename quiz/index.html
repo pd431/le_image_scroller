@@ -1,0 +1,77 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Quiz</title>
+<link rel="stylesheet" href="style.css" />
+</head>
+<body>
+  <header>
+    <h1>Quiz</h1>
+    <div class="dataset-info" id="datasetInfo">Loading…</div>
+    <div class="actions">
+      <a class="guide-link" href="../guide.html">Guide</a>
+      <button id="importBtn">Import…</button>
+      <input type="file" id="importFile" accept="application/json" hidden />
+    </div>
+  </header>
+
+  <main>
+    <aside class="side-panel panel">
+      <section id="showcaseSection" hidden>
+        <details id="allAnnDetails" open>
+          <summary>All annotations <span class="count" id="totalAnnCount">0</span></summary>
+          <div class="all-ann-controls">
+            <label for="sortOrder">Sort by</label>
+            <select id="sortOrder">
+              <option value="slice">Slice order</option>
+              <option value="type">Type</option>
+              <option value="title-asc">Title A–Z</option>
+              <option value="title-desc">Title Z–A</option>
+            </select>
+          </div>
+          <ul class="annotation-list" id="showcaseList"></ul>
+        </details>
+      </section>
+
+      <section id="quizSection" hidden>
+        <h2>To place <span class="count" id="targetsCount">0</span></h2>
+        <p class="hint" id="modeHint"></p>
+        <ul class="annotation-list" id="targetsList"></ul>
+      </section>
+
+      <section id="checkSection" hidden>
+        <button id="checkBtn">Check my answers</button>
+        <div class="score-summary" id="scoreSummary"></div>
+        <button id="resetBtn" class="danger" hidden>Try again</button>
+      </section>
+    </aside>
+
+    <section class="stage-panel">
+      <div class="stage-wrap">
+        <div class="stage" id="stage">
+          <div class="svg-host" id="svgHost"></div>
+          <svg class="tolerance-layer" id="toleranceLayer" viewBox="0 0 400 400"></svg>
+          <div class="marker-layer" id="markerLayer"></div>
+        </div>
+      </div>
+      <div class="controls">
+        <button id="play">Play</button>
+        <div class="slider-wrap">
+          <input id="scrub" type="range" min="1" value="1" step="1" />
+          <div class="tick-row hint" id="hintTicks"></div>
+          <div class="tick-row mine" id="mineTicks"></div>
+        </div>
+        <span class="readout" id="readout">1 / ?</span>
+      </div>
+    </section>
+
+    <aside class="inspector panel" id="inspector">
+      <p class="hint placeholder">Loading…</p>
+    </aside>
+  </main>
+
+  <script src="app.js"></script>
+</body>
+</html>
