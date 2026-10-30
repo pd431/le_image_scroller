@@ -1,14 +1,15 @@
 {
   "name": "radiology-scanner",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "private": true,
   "description": "Static annotator + quiz tools for a stack of scan slices",
   "scripts": {
     "serve": "python3 -m http.server 8000",
     "test": "node tests/e2e.test.js",
+    "test:a11y": "node tests/a11y.test.js",
     "test:py": "python3 -m unittest discover tests",
     "check:contrast": "python3 scripts/check_contrast.py",
-    "check:all": "npm run check:contrast && npm run test:py && npm test"
+    "check:all": "npm run check:contrast && npm run test:py && npm test && npm run test:a11y"
   },
   "devDependencies": {
     "playwright": "^1.49.0"

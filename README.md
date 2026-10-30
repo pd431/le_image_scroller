@@ -158,10 +158,18 @@ opens it in the inspector.
 
 An annotation can **span several slices**: the inspector's "Slices"
 section takes a from/to range and the annotation then appears on every
-slice in it with the same zone. "Edit zone on: slice N only" switches
-the position and tolerance controls (and marker dragging) to a
-per-slice override for the current slice; adjusted slices are listed
-with a reset button, and a dashed ring marks an overridden marker.
+slice in it with one shared zone. Because an organ can look different
+on each slice, any slice can have **its own zone of a different size
+or shape**. The "Zone per slice" section shows a strip with one chip
+per slice in range (a dot marks slices with their own zone; click a
+chip to go there), and an "Edit the zone on" choice: *All slices* edits
+the shared zone, *Slice N only* gives the current slice its own copy
+and makes the position, radius and shape controls (and marker
+dragging) act on that copy; a badge on the image says which you are
+editing. From there, *Copy from* seeds the current slice's zone from
+the shared zone or another custom slice, *Use on all slices* promotes
+the current slice's zone to the shared one, and *Reset to shared*
+drops it. A dashed ring marks a marker whose slice has its own zone.
 "This slice only" collapses the range back to one slice, keeping the
 zone in effect on the slice you're looking at.
 
@@ -283,15 +291,27 @@ What this does *not* give you: the quiz answers are in
 ```
 npm install            # Playwright, for the browser tests
 npm test               # end-to-end tests (headless Chromium, ~10 s)
+npm run test:a11y      # visual-accessibility checks (~2 min, see below)
 npm run test:py        # Python unit tests: manifest hashing, contrast maths
 npm run check:contrast # APCA + WCAG 2.2 AA check of the colour tokens
-npm run check:all      # all three
+npm run check:all      # all of the above
 ```
+
+`tests/a11y.test.js` opens both tools in nine UI states at seven
+viewports (1920 down to a 390px phone, tablets with touch) and, for
+every interactive element, checks that nothing covers it, that it is
+at least 24×24 CSS px (32 on touch), that it has an accessible name,
+that it overlaps nothing else, and that keyboard focus shows a ring;
+each state is repeated at 200% zoom (half viewport, device scale 2).
+It runs in Chromium, and also in Firefox when Playwright's Firefox is
+installed (`npx playwright install firefox`); Firefox matters because
+it always draws spinner buttons inside number inputs, which is what
+first hid the slice range fields.
 
 `shared/theme.css` holds every colour as a token on `:root`.
 `scripts/check_contrast.py` checks each foreground/background pairing
 the UI uses against APCA (Lc 75 body text, Lc 60 large/UI text, Lc 45
 non-text) and WCAG 2.2 AA (4.5:1 text, 3:1 large text and non-text),
 and exits non-zero on failure. When you add a colour, add its pairing
-to `PAIRS` in that script. Keyboard-only operation of marker placement
-is not supported yet.
+to `PAIRS` in that script. Marker placement still needs a pointer;
+keyboard-only placement is the remaining accessibility gap.
