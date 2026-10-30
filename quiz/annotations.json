@@ -1,7 +1,8 @@
 {
-  "version": 2,
+  "version": 3,
   "exportMode": "quiz",
   "quizMode": "guided",
+  "datasetHash": "f54b7ff91c0f9f80574d96d100bc006653718e1f3902db1a88c2a45f2ee4778f",
   "dataset": {
     "size": 400,
     "sliceCount": 40,
@@ -11,7 +12,8 @@
     {
       "id": "a-etupxsq3mrf1hx5p",
       "type": "pin",
-      "sliceIndex": 3,
+      "sliceFrom": 3,
+      "sliceTo": 3,
       "layer": "calyx",
       "x": 0.5,
       "y": 0.5,
@@ -25,7 +27,8 @@
     {
       "id": "a-x865086fmrf1hxma",
       "type": "label",
-      "sliceIndex": 18,
+      "sliceFrom": 14,
+      "sliceTo": 24,
       "layer": "core",
       "x": 0.5,
       "y": 0.4900486734657805,
@@ -38,7 +41,8 @@
     {
       "id": "a-4lbaru8mmrf1hy24",
       "type": "pin",
-      "sliceIndex": 20,
+      "sliceFrom": 20,
+      "sliceTo": 20,
       "layer": "flesh",
       "x": 0.16431752200579752,
       "y": 0.5155559557055995,
@@ -52,7 +56,8 @@
     {
       "id": "a-qzz3nivkmrf1hydm",
       "type": "label",
-      "sliceIndex": 20,
+      "sliceFrom": 20,
+      "sliceTo": 20,
       "layer": "skin",
       "x": 0.5,
       "y": 0.15620625353506787,
@@ -65,7 +70,8 @@
     {
       "id": "a-djm5ylfamrf1hytd",
       "type": "mcq",
-      "sliceIndex": 22,
+      "sliceFrom": 22,
+      "sliceTo": 22,
       "layer": "core",
       "x": 0.5,
       "y": 0.5,
@@ -84,7 +90,8 @@
     {
       "id": "a-v8akm2whmrf1hzbf",
       "type": "label",
-      "sliceIndex": 38,
+      "sliceFrom": 38,
+      "sliceTo": 38,
       "layer": "stem",
       "x": 0.5,
       "y": 0.5,

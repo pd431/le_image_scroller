@@ -8,6 +8,7 @@ build_manifest.py (for rebuilding the index after manually adding,
 removing, or renaming images in the folder).
 """
 
+import hashlib
 import json
 import os
 import re
@@ -43,10 +44,31 @@ def scan_slice_files(slices_dir):
     return sorted(names, key=_natural_sort_key)
 
 
+def hash_file(path):
+    """SHA-256 hex digest of a file's bytes."""
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def dataset_hash(files, file_hashes):
+    """Fingerprint of the whole stack: the ordered list of filenames and
+    their content hashes. Any added, removed, renamed or re-ordered slice
+    changes it, which is exactly what makes an annotation export stop
+    lining up - so exports carry this value and the apps compare it."""
+    h = hashlib.sha256()
+    for name in files:
+        h.update(f"{name}:{file_hashes[name]}\n".encode("utf-8"))
+    return h.hexdigest()
+
+
 def build_manifest(slices_dir, overrides=None):
     """Scan slices_dir and write manifest.json there. size/axis/layers
     are preserved from any existing manifest.json unless overridden;
-    sliceCount/files always reflect the current directory contents."""
+    sliceCount/files/fileHashes/datasetHash always reflect the current
+    directory contents."""
     manifest_path = os.path.join(slices_dir, "manifest.json")
     overrides = overrides or {}
 
@@ -59,6 +81,7 @@ def build_manifest(slices_dir, overrides=None):
                 existing = {}
 
     files = scan_slice_files(slices_dir)
+    file_hashes = {name: hash_file(os.path.join(slices_dir, name)) for name in files}
 
     manifest = {
         "size": overrides.get("size", existing.get("size", DEFAULTS["size"])),
@@ -66,6 +89,8 @@ def build_manifest(slices_dir, overrides=None):
         "axis": overrides.get("axis", existing.get("axis", DEFAULTS["axis"])),
         "layers": overrides.get("layers", existing.get("layers", DEFAULTS["layers"])),
         "files": files,
+        "fileHashes": file_hashes,
+        "datasetHash": dataset_hash(files, file_hashes),
     }
 
     with open(manifest_path, "w") as f:
