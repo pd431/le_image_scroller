@@ -3,7 +3,11 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
+<!-- Only this folder's own scripts may run: the backstop behind the SVG
+     sanitiser and output escaping in app.js. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'" />
 <title>Annotator</title>
+<link rel="stylesheet" href="../shared/theme.css" />
 <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -12,12 +16,13 @@
     <div class="dataset-info" id="datasetInfo">Loading dataset…</div>
     <div class="actions">
       <a class="guide-link" href="../guide.html">Guide</a>
-      <button id="importBtn">Import…</button>
-      <input type="file" id="importFile" accept="application/json" hidden />
-      <button id="exportBtn">Export annotations</button>
-      <button id="clearBtn" class="danger">Clear all</button>
+      <button id="importBtn" type="button">Import…</button>
+      <input type="file" id="importFile" accept="application/json,.json" hidden />
+      <button id="exportBtn" type="button">Export annotations</button>
+      <button id="clearBtn" type="button" class="danger">Clear all</button>
     </div>
   </header>
+  <div class="notices" id="notices"></div>
 
   <main>
     <aside class="side-panel panel">
@@ -26,21 +31,21 @@
         <p class="hint" id="paletteHint">Drag a type onto the slice and drop it on the feature you want to mark — or on touch, tap a type then tap the slice.</p>
         <div class="palette">
           <div class="palette-item" data-type="label">
-            <span class="icon label"></span>
+            <span class="icon label" aria-hidden="true"></span>
             <div>
               <strong>Text label</strong>
               <span>Short label shown right on the image</span>
             </div>
           </div>
           <div class="palette-item" data-type="pin">
-            <span class="icon pin">i</span>
+            <span class="icon pin" aria-hidden="true">i</span>
             <div>
               <strong>Pin + description</strong>
               <span>Marker with a longer write-up</span>
             </div>
           </div>
           <div class="palette-item" data-type="mcq">
-            <span class="icon mcq">?</span>
+            <span class="icon mcq" aria-hidden="true">?</span>
             <div>
               <strong>MCQ</strong>
               <span>Marker with a multiple-choice question</span>
@@ -75,14 +80,14 @@
       <div class="stage-wrap">
         <div class="stage" id="stage">
           <div class="svg-host" id="svgHost"></div>
-          <svg class="tolerance-layer" id="toleranceLayer" viewBox="0 0 400 400"></svg>
+          <svg class="tolerance-layer" id="toleranceLayer" viewBox="0 0 400 400" aria-hidden="true"></svg>
           <div class="marker-layer" id="markerLayer"></div>
         </div>
       </div>
       <div class="controls">
-        <button id="play">Play</button>
-        <input id="scrub" type="range" min="1" value="1" step="1" />
-        <span class="readout" id="readout">1 / ?</span>
+        <button id="play" type="button" aria-pressed="false">Play</button>
+        <input id="scrub" type="range" min="1" value="1" step="1" aria-label="Slice" />
+        <span class="readout" id="readout" aria-live="polite">1 / ?</span>
       </div>
     </section>
 
@@ -91,6 +96,7 @@
     </aside>
   </main>
 
+  <script src="../shared/common.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

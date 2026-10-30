@@ -1,12 +1,17 @@
 (() => {
+  "use strict";
+  const S = window.Scanner;
+  const {
+    el, clamp, escapeHtml, uid, TYPE_LABELS, DEFAULT_TOLERANCE,
+    appliesToSlice, isMultiSlice, hasOverride, zoneFor, rangeLabel,
+    summaryFor, iconHtmlFor, sortAnnotations, toleranceShapeMarkup,
+  } = S;
+
   const MANIFEST_URL = "../data/slices/manifest.json";
   const SLICE_URL = (filename) => `../data/slices/${encodeURIComponent(filename)}`;
-  const isSvgFilename = (filename) => /\.svg$/i.test(filename);
-  const STORAGE_KEY = "annotator:apple:v2";
-  const TYPE_LABELS = { label: "Text label", pin: "Pin + description", mcq: "MCQ" };
-  const DEFAULT_TOLERANCE = { mode: "radius", radius: 0.06 };
+  const LEGACY_STORAGE_KEY = "annotator:apple:v2";
+  const LEGACY_BACKUP_KEY = "annotator:legacy-backup:v2";
 
-  const el = (id) => document.getElementById(id);
   const stage = el("stage");
   const svgHost = el("svgHost");
   const toleranceLayer = el("toleranceLayer");
@@ -30,193 +35,221 @@
 
   const state = {
     manifest: null,
+    store: null,
+    loader: null,
+    player: null,
     currentIndex: 1,
     annotations: [],
     selectedId: null,
     drawing: null, // { annId, points: [{x,y}] }
     armedType: null, // palette type staged for tap-to-place (touch-friendly path)
-    playing: false,
-    playTimer: null,
+    // For a multi-slice annotation: "all" edits the default zone, "slice"
+    // edits (creating if needed) this slice's override.
+    editScope: "all",
   };
 
-  function uid() {
-    return "a-" + Math.random().toString(36).slice(2, 10) + Date.now().toString(36);
-  }
-
-  function clamp(v, min, max) {
-    return Math.min(max, Math.max(min, v));
-  }
-
-  function escapeHtml(str) {
-    return String(str).replace(/[&<>"']/g, (c) => (
-      { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]
-    ));
-  }
-
-  function loadStoredAnnotations() {
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      const parsed = raw ? JSON.parse(raw) : [];
-      return Array.isArray(parsed) ? parsed : [];
-    } catch {
-      return [];
-    }
-  }
+  // --- persistence -----------------------------------------------------------------
 
   function persist() {
-    try {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(state.annotations));
-    } catch {
-      /* storage unavailable or full: annotations still live in memory */
+    if (!state.store) return;
+    const ok = state.store.write(state.annotations);
+    if (ok) {
+      S.dismissNotice("storage");
+    } else {
+      S.notify("warn", "Autosave isn't working in this browser, so changes will be lost when the page reloads. Use Export annotations to keep your work.", { id: "storage", dismissible: false });
     }
   }
 
-  function normalizeTolerance(ann) {
-    if (!ann.tolerance) ann.tolerance = { ...DEFAULT_TOLERANCE };
-    if (typeof ann.tolerance.radius !== "number") ann.tolerance.radius = DEFAULT_TOLERANCE.radius;
-    if (ann.tolerance.mode !== "polygon") ann.tolerance.mode = "radius";
-  }
-
-  // Abandoning a draw (navigating away, Escape, Cancel) without >=3 points
-  // falls back to radius mode rather than leaving a dangling "polygon" mode
-  // with nothing to show.
-  function cancelDrawing() {
-    if (!state.drawing) return null;
-    const ann = state.annotations.find((a) => a.id === state.drawing.annId);
-    state.drawing = null;
-    stage.classList.remove("drawing-mode");
-    if (ann) {
-      const hasPolygon = Array.isArray(ann.tolerance.polygon) && ann.tolerance.polygon.length >= 3;
-      if (!hasPolygon) ann.tolerance.mode = "radius";
+  async function restoreAnnotations() {
+    const saved = state.store.read();
+    if (Array.isArray(saved) && saved.length) {
+      state.annotations = S.normalizeAnnotations(saved, state.manifest.sliceCount).annotations;
+      return;
     }
-    return ann;
+    // One-time recovery of work saved by the previous version, which used a
+    // single shared key. Declining moves it to a backup key so it's neither
+    // offered again nor lost.
+    const legacy = S.createStore(LEGACY_STORAGE_KEY);
+    const old = legacy.read();
+    if (!Array.isArray(old) || !old.length) return;
+    const yes = await S.confirmDialog({
+      title: "Recover earlier annotations?",
+      message: `${old.length} annotation${old.length === 1 ? "" : "s"} saved by an earlier version of the annotator were found. Recover them into this image stack? They were made before stacks were fingerprinted, so check they line up.`,
+      confirmLabel: "Recover",
+      cancelLabel: "Not now",
+    });
+    if (yes) {
+      state.annotations = S.normalizeAnnotations(old, state.manifest.sliceCount).annotations;
+      legacy.remove();
+      persist();
+    } else {
+      S.createStore(LEGACY_BACKUP_KEY).write(old);
+      legacy.remove();
+    }
   }
 
-  // --- dataset / slice loading --------------------------------------------
+  // --- init --------------------------------------------------------------------------
 
   async function init() {
-    state.annotations = loadStoredAnnotations().map((a) => {
-      const ann = { ...a, id: a.id || uid() };
-      normalizeTolerance(ann);
-      return ann;
+    try {
+      state.manifest = await S.loadManifest(MANIFEST_URL);
+    } catch (err) {
+      S.showFatal(err);
+      return;
+    }
+    const m = state.manifest;
+    state.store = S.createStore(`annotator:${m.datasetHash || "unfingerprinted"}:v3`);
+    state.loader = S.createSliceLoader({ host: svgHost, manifest: m, sliceUrl: SLICE_URL });
+    state.player = S.createPlayer({
+      button: playBtn,
+      interval: 300,
+      step: () => loadSlice(state.currentIndex >= m.sliceCount ? 1 : state.currentIndex + 1),
     });
 
-    const res = await fetch(MANIFEST_URL);
-    state.manifest = await res.json();
-    scrub.max = state.manifest.sliceCount;
-    toleranceLayer.setAttribute("viewBox", `0 0 ${state.manifest.size} ${state.manifest.size}`);
-    datasetInfo.textContent = `${state.manifest.sliceCount} slices · ${state.manifest.axis || ""}`;
+    scrub.max = m.sliceCount;
+    toleranceLayer.setAttribute("viewBox", `0 0 ${m.size} ${m.size}`);
+    datasetInfo.textContent = `${m.sliceCount} slices · ${m.axis || ""}`;
 
+    if (!S.storageAvailable()) {
+      S.notify("warn", "This browser is blocking storage (common inside an embedded frame), so autosave is off. Use Export annotations to keep your work.", { id: "storage", dismissible: false });
+    }
+    if (!m.datasetHash) {
+      S.notify("info", "This image stack has no fingerprint, so exports can't be checked against it later. Run `python3 scripts/build_manifest.py` to add one.", { id: "nohash" });
+    }
+
+    await restoreAnnotations();
     await loadSlice(1);
     renderGlobalList();
     wireGlobalControls();
   }
 
-  // SVGs are fetched and injected inline so their shapes are real DOM
-  // elements - that's what makes layer detection (elementFromPoint +
-  // data-layer) possible. Any other image format (a real scan export -
-  // PNG/JPG/etc.) is just rendered as a plain <img>; layer detection then
-  // naturally finds nothing, which the rest of the app already treats as
-  // "no layer" rather than an error.
-  async function loadSliceImage(filename) {
-    svgHost.innerHTML = "";
-    if (isSvgFilename(filename)) {
-      const res = await fetch(SLICE_URL(filename));
-      svgHost.innerHTML = await res.text();
-      return;
-    }
-    const img = document.createElement("img");
-    img.src = SLICE_URL(filename);
-    img.alt = "";
-    img.draggable = false;
-    svgHost.appendChild(img);
-  }
+  // --- slice navigation -------------------------------------------------------------
 
   async function loadSlice(index) {
-    state.currentIndex = index;
-
+    index = clamp(index, 1, state.manifest.sliceCount);
     cancelDrawing();
+    const shown = await state.loader.load(index);
+    if (!shown) return; // a later request took over
+    state.currentIndex = index;
     if (state.selectedId) {
-      const sel = state.annotations.find((a) => a.id === state.selectedId);
-      if (!sel || sel.sliceIndex !== index) state.selectedId = null;
+      const sel = findAnn(state.selectedId);
+      if (!sel || !appliesToSlice(sel, index)) state.selectedId = null;
     }
-
-    const filename = state.manifest.files[index - 1];
-    await loadSliceImage(filename);
     scrub.value = index;
     readout.textContent = `${index} / ${state.manifest.sliceCount}`;
-
-    renderMarkers();
-    renderToleranceOverlay();
-    renderAnnotationList();
-    renderInspector();
-  }
-
-  function stopPlaying() {
-    state.playing = false;
-    playBtn.textContent = "Play";
-    clearInterval(state.playTimer);
+    renderAll();
   }
 
   async function navigateToAnnotation(id) {
-    const ann = state.annotations.find((a) => a.id === id);
+    const ann = findAnn(id);
     if (!ann) return;
-    stopPlaying();
-    if (ann.sliceIndex !== state.currentIndex) await loadSlice(ann.sliceIndex);
+    state.player.stop();
+    if (!appliesToSlice(ann, state.currentIndex)) await loadSlice(ann.sliceFrom);
     selectAnnotation(id);
   }
 
-  // --- layer detection ---------------------------------------------------
-
-  function layerFromEventTarget(target) {
-    const layerEl = target && target.closest ? target.closest("[data-layer]") : null;
-    return layerEl ? layerEl.getAttribute("data-layer") : null;
+  function findAnn(id) {
+    return state.annotations.find((a) => a.id === id);
   }
+
+  function annotationsForCurrentSlice() {
+    return state.annotations.filter((a) => appliesToSlice(a, state.currentIndex));
+  }
+
+  // --- zone editing (default vs per-slice override) ---------------------------------
+
+  /** The object whose x/y/tolerance the current edit should change. */
+  function editTarget(ann) {
+    if (isMultiSlice(ann) && state.editScope === "slice") {
+      if (!ann.overrides[state.currentIndex]) {
+        ann.overrides[state.currentIndex] = {
+          x: ann.x,
+          y: ann.y,
+          tolerance: JSON.parse(JSON.stringify(ann.tolerance)),
+        };
+      }
+      return ann.overrides[state.currentIndex];
+    }
+    return ann;
+  }
+
+  /** The zone currently displayed for the inspector's controls. */
+  function viewZone(ann) {
+    if (isMultiSlice(ann) && state.editScope === "slice") return zoneFor(ann, state.currentIndex);
+    return ann;
+  }
+
+  function setRange(ann, from, to) {
+    from = clamp(Math.round(from) || 1, 1, state.manifest.sliceCount);
+    to = clamp(Math.round(to) || from, 1, state.manifest.sliceCount);
+    if (from > to) [from, to] = [to, from];
+    ann.sliceFrom = from;
+    ann.sliceTo = to;
+    for (const key of Object.keys(ann.overrides)) {
+      const idx = Number(key);
+      if (idx < from || idx > to) delete ann.overrides[key];
+    }
+    if (!isMultiSlice(ann)) state.editScope = "all";
+  }
+
+  // --- drawing a polygon zone --------------------------------------------------------
+
+  // Abandoning a draw (navigating away, Escape, Cancel) without >=3 points
+  // falls back to radius mode rather than leaving a dangling "polygon" mode
+  // with nothing to show.
+  function cancelDrawing() {
+    if (!state.drawing) return;
+    const ann = findAnn(state.drawing.annId);
+    state.drawing = null;
+    stage.classList.remove("drawing-mode");
+    if (ann) {
+      const zone = viewZone(ann);
+      const hasPolygon = Array.isArray(zone.tolerance.polygon) && zone.tolerance.polygon.length >= 3;
+      if (!hasPolygon) zone.tolerance.mode = "radius";
+    }
+  }
+
+  // --- layer detection ---------------------------------------------------------------
 
   function layerAtPoint(clientX, clientY, ignoreEl) {
     const prevDisplay = ignoreEl ? ignoreEl.style.display : null;
     if (ignoreEl) ignoreEl.style.display = "none";
     const target = document.elementFromPoint(clientX, clientY);
     if (ignoreEl) ignoreEl.style.display = prevDisplay;
-    return layerFromEventTarget(target);
+    const layerEl = target && target.closest ? target.closest("[data-layer]") : null;
+    return layerEl ? layerEl.getAttribute("data-layer") : null;
   }
 
-  // --- selection -----------------------------------------------------------
+  // --- selection ----------------------------------------------------------------------
 
   function selectAnnotation(id) {
+    if (state.selectedId !== id) state.editScope = "all";
     state.selectedId = id;
     state.drawing = null;
     stage.classList.remove("drawing-mode");
     setArmed(null);
-    renderInspector();
-    renderMarkers();
-    renderToleranceOverlay();
-    renderAnnotationList();
-    renderGlobalList();
+    renderAll();
   }
 
   function deselectAnnotation() {
     if (!state.selectedId && !state.drawing) return;
     state.selectedId = null;
     state.drawing = null;
+    state.editScope = "all";
     stage.classList.remove("drawing-mode");
     setArmed(null);
-    renderInspector();
+    renderAll();
+  }
+
+  function renderAll() {
     renderMarkers();
     renderToleranceOverlay();
     renderAnnotationList();
     renderGlobalList();
+    renderInspector();
   }
 
-  function removeAnnotation(id) {
-    state.annotations = state.annotations.filter((a) => a.id !== id);
-  }
-
-  // --- markers ---------------------------------------------------------------
-
-  function annotationsForCurrentSlice() {
-    return state.annotations.filter((a) => a.sliceIndex === state.currentIndex);
-  }
+  // --- markers -------------------------------------------------------------------------
 
   function renderMarkers() {
     markerLayer.innerHTML = "";
@@ -224,10 +257,13 @@
   }
 
   function buildMarkerEl(ann) {
+    const zone = zoneFor(ann, state.currentIndex);
     const div = document.createElement("div");
-    div.className = `marker ${ann.type}` + (ann.id === state.selectedId ? " selected" : "");
-    div.style.left = `${ann.x * 100}%`;
-    div.style.top = `${ann.y * 100}%`;
+    div.className = `marker ${ann.type}`
+      + (ann.id === state.selectedId ? " selected" : "")
+      + (hasOverride(ann, state.currentIndex) ? " overridden" : "");
+    div.style.left = `${zone.x * 100}%`;
+    div.style.top = `${zone.y * 100}%`;
     div.dataset.id = ann.id;
 
     if (ann.type === "label") {
@@ -235,7 +271,7 @@
     } else if (ann.type === "pin") {
       div.title = ann.title || "Pin";
       div.innerHTML = `<span class="icon-circle">i</span>`;
-    } else if (ann.type === "mcq") {
+    } else {
       div.title = ann.question || "MCQ";
       div.innerHTML = `<span class="icon-circle">?</span>`;
     }
@@ -249,8 +285,9 @@
       e.preventDefault();
       div.setPointerCapture(e.pointerId);
       let dragging = false;
-      let pendingX = ann.x;
-      let pendingY = ann.y;
+      const start = zoneFor(ann, state.currentIndex);
+      let pendingX = start.x;
+      let pendingY = start.y;
       const startX = e.clientX;
       const startY = e.clientY;
 
@@ -264,23 +301,27 @@
         pendingY = clamp((moveEvt.clientY - rect.top) / rect.height, 0, 1);
         div.style.left = `${pendingX * 100}%`;
         div.style.top = `${pendingY * 100}%`;
-        renderToleranceOverlayThrottled();
       };
 
       const onUp = (upEvt) => {
         div.removeEventListener("pointermove", onMove);
-        if (dragging) {
-          ann.x = pendingX;
-          ann.y = pendingY;
+        if (!dragging) {
+          selectAnnotation(ann.id);
+          return;
+        }
+        if (ann.id !== state.selectedId) {
+          state.selectedId = ann.id;
+          state.editScope = "all";
+        }
+        const target = editTarget(ann);
+        target.x = pendingX;
+        target.y = pendingY;
+        if (target === ann) {
           const newLayer = layerAtPoint(upEvt.clientX, upEvt.clientY, div);
           if (newLayer) ann.layer = newLayer;
-          persist();
-          renderAnnotationList();
-          renderGlobalList();
-          renderToleranceOverlay();
-        } else {
-          selectAnnotation(ann.id);
         }
+        persist();
+        renderAll();
       };
 
       div.addEventListener("pointermove", onMove);
@@ -288,27 +329,7 @@
     });
   }
 
-  let toleranceRaf = null;
-  function renderToleranceOverlayThrottled() {
-    if (toleranceRaf) return;
-    toleranceRaf = requestAnimationFrame(() => {
-      toleranceRaf = null;
-      renderToleranceOverlay();
-    });
-  }
-
-  // --- tolerance overlay (radius / custom polygon) ----------------------------
-
-  function toleranceShapeMarkup(ann, size, isSelected) {
-    const t = ann.tolerance;
-    const cls = isSelected ? "tolerance selected" : "tolerance";
-    if (t.mode === "polygon" && t.polygon && t.polygon.length >= 3) {
-      const pts = t.polygon.map((p) => `${(p.x * size).toFixed(1)},${(p.y * size).toFixed(1)}`).join(" ");
-      return `<polygon class="${cls}" points="${pts}" />`;
-    }
-    const r = (t.radius ?? DEFAULT_TOLERANCE.radius) * size;
-    return `<circle class="${cls}" cx="${(ann.x * size).toFixed(1)}" cy="${(ann.y * size).toFixed(1)}" r="${r.toFixed(1)}" />`;
-  }
+  // --- zone overlay -----------------------------------------------------------------------
 
   function renderToleranceOverlay() {
     if (!state.manifest) return;
@@ -316,30 +337,27 @@
     const parts = [];
 
     annotationsForCurrentSlice().forEach((ann) => {
-      normalizeTolerance(ann);
-      parts.push(toleranceShapeMarkup(ann, size, ann.id === state.selectedId));
+      const zone = zoneFor(ann, state.currentIndex);
+      parts.push(toleranceShapeMarkup(zone, size, ann.id === state.selectedId ? "tolerance selected" : "tolerance"));
     });
 
-    if (state.drawing) {
+    if (state.drawing && state.drawing.points.length) {
       const pts = state.drawing.points;
-      if (pts.length) {
-        const ptsAttr = pts.map((p) => `${(p.x * size).toFixed(1)},${(p.y * size).toFixed(1)}`).join(" ");
-        parts.push(`<polyline class="draft-line" points="${ptsAttr}" />`);
-        pts.forEach((p) => parts.push(`<circle class="draft-point" cx="${(p.x * size).toFixed(1)}" cy="${(p.y * size).toFixed(1)}" r="4" />`));
-      }
+      const ptsAttr = pts.map((p) => `${(p.x * size).toFixed(1)},${(p.y * size).toFixed(1)}`).join(" ");
+      parts.push(`<polyline class="draft-line" points="${ptsAttr}" />`);
+      pts.forEach((p) => parts.push(`<circle class="draft-point" cx="${(p.x * size).toFixed(1)}" cy="${(p.y * size).toFixed(1)}" r="4" />`));
     }
 
     toleranceLayer.innerHTML = parts.join("");
   }
 
-  // --- palette placement: drag-and-drop (mouse) or tap-to-arm (touch) --------
+  // --- palette placement: drag-and-drop (mouse) or tap-to-arm (touch) -----------------
   //
   // Native HTML5 drag-and-drop does not work on touch browsers (notably iOS
   // Safari), so placement is driven entirely by Pointer Events instead: a
   // press-and-move on a palette item drags a ghost chip onto the stage
   // (works with mouse, pen and touch alike); a plain tap "arms" that type so
-  // the next tap on the stage places it there, which is far more reliable on
-  // a scrolling touch layout than a long drag gesture.
+  // the next tap on the stage places it there.
 
   function isPointInRect(x, y, rect) {
     return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
@@ -360,15 +378,25 @@
     const x = clamp((clientX - rect.left) / rect.width, 0, 1);
     const y = clamp((clientY - rect.top) / rect.height, 0, 1);
     const layer = layerAtPoint(clientX, clientY, null);
-
     const ann = createDefaultAnnotation(type, x, y, layer);
     state.annotations.push(ann);
     persist();
-    renderMarkers();
-    renderToleranceOverlay();
-    renderAnnotationList();
-    renderGlobalList();
     selectAnnotation(ann.id);
+  }
+
+  function createDefaultAnnotation(type, x, y, layer) {
+    const base = {
+      id: uid(), type, sliceFrom: state.currentIndex, sliceTo: state.currentIndex, layer, x, y,
+      tolerance: { ...DEFAULT_TOLERANCE }, overrides: {},
+    };
+    if (type === "label") return { ...base, text: "" };
+    if (type === "pin") return { ...base, title: "", description: "" };
+    return {
+      ...base,
+      question: "What condition does this point to?",
+      options: ["Rot", "Bite mark", "Healthy apple"],
+      answer: "Rot",
+    };
   }
 
   function createGhost(type) {
@@ -379,18 +407,12 @@
     return ghost;
   }
 
-  function positionGhost(ghost, x, y) {
-    ghost.style.left = `${x}px`;
-    ghost.style.top = `${y}px`;
-  }
-
   function beginPaletteInteraction(item, downEvent) {
     if (state.drawing) {
       cancelDrawing();
       renderInspector();
       renderToleranceOverlay();
     }
-
     const type = item.dataset.type;
     const startX = downEvent.clientX;
     const startY = downEvent.clientY;
@@ -406,20 +428,17 @@
       stage.classList.remove("drag-over");
       if (ghost) ghost.remove();
     };
-
     const onMove = (e) => {
-      const dx = e.clientX - startX;
-      const dy = e.clientY - startY;
-      if (!dragging && Math.hypot(dx, dy) > 10) {
+      if (!dragging && Math.hypot(e.clientX - startX, e.clientY - startY) > 10) {
         dragging = true;
         setArmed(null);
         ghost = createGhost(type);
       }
       if (!dragging) return;
-      positionGhost(ghost, e.clientX, e.clientY);
+      ghost.style.left = `${e.clientX}px`;
+      ghost.style.top = `${e.clientY}px`;
       stage.classList.toggle("drag-over", isPointInRect(e.clientX, e.clientY, stage.getBoundingClientRect()));
     };
-
     const onUp = (e) => {
       cleanup();
       if (dragging) {
@@ -429,7 +448,6 @@
         setArmed(state.armedType === type ? null : type);
       }
     };
-
     const onCancel = () => cleanup();
 
     item.addEventListener("pointermove", onMove);
@@ -447,60 +465,33 @@
     });
 
     stage.addEventListener("click", (e) => {
+      const rect = stage.getBoundingClientRect();
       if (state.drawing) {
-        const rect = stage.getBoundingClientRect();
-        const x = clamp((e.clientX - rect.left) / rect.width, 0, 1);
-        const y = clamp((e.clientY - rect.top) / rect.height, 0, 1);
-        state.drawing.points.push({ x, y });
-        const ann = state.annotations.find((a) => a.id === state.drawing.annId);
-        rebuildToleranceControls(ann);
+        state.drawing.points.push({
+          x: clamp((e.clientX - rect.left) / rect.width, 0, 1),
+          y: clamp((e.clientY - rect.top) / rect.height, 0, 1),
+        });
+        const ann = findAnn(state.drawing.annId);
+        if (ann) rebuildZoneControls(ann);
         renderToleranceOverlay();
         return;
       }
       if (state.armedType) {
         if (e.target.closest(".marker")) return;
-        const rect = stage.getBoundingClientRect();
         placeAnnotation(state.armedType, e.clientX, e.clientY, rect);
         setArmed(null);
         return;
       }
-      if (state.selectedId && !e.target.closest(".marker")) {
-        deselectAnnotation();
-      }
+      if (state.selectedId && !e.target.closest(".marker")) deselectAnnotation();
     });
   }
 
-  function createDefaultAnnotation(type, x, y, layer) {
-    const base = { id: uid(), type, sliceIndex: state.currentIndex, layer, x, y, tolerance: { ...DEFAULT_TOLERANCE } };
-    if (type === "label") return { ...base, text: "" };
-    if (type === "pin") return { ...base, title: "", description: "" };
-    return {
-      ...base,
-      question: "What condition does this point to?",
-      options: ["Rot", "Bite mark", "Healthy apple"],
-      answer: "Rot",
-    };
-  }
-
-  // --- annotation lists (per-slice + global) ---------------------------------
-
-  function summaryFor(ann) {
-    if (ann.type === "label") return ann.text || "(empty label)";
-    if (ann.type === "pin") return ann.title || "(untitled pin)";
-    return ann.question || "(untitled question)";
-  }
-
-  function iconHtmlFor(type) {
-    if (type === "label") return '<span class="icon label"></span>';
-    if (type === "pin") return '<span class="icon pin">i</span>';
-    return '<span class="icon mcq">?</span>';
-  }
+  // --- lists ------------------------------------------------------------------------------
 
   function renderAnnotationList() {
     const items = annotationsForCurrentSlice();
     sliceAnnCountEl.textContent = items.length;
     annotationListEl.innerHTML = "";
-
     if (!items.length) {
       const li = document.createElement("li");
       li.className = "empty";
@@ -508,39 +499,23 @@
       annotationListEl.appendChild(li);
       return;
     }
-
     items.forEach((ann) => {
       const li = document.createElement("li");
       if (ann.id === state.selectedId) li.classList.add("active");
       li.innerHTML = `
         ${iconHtmlFor(ann.type)}
         <span class="label-text">${escapeHtml(summaryFor(ann))}</span>
-        <span class="layer-tag">${escapeHtml(ann.layer || "—")}</span>
-      `;
+        ${isMultiSlice(ann) ? `<span class="slice-tag" title="Spans slices ${rangeLabel(ann)}">#${rangeLabel(ann)}</span>` : ""}
+        <span class="layer-tag">${escapeHtml(ann.layer || "—")}</span>`;
       li.addEventListener("click", () => selectAnnotation(ann.id));
       annotationListEl.appendChild(li);
     });
-  }
-
-  function sortAnnotations(list, order) {
-    const copy = list.slice();
-    if (order === "type") {
-      return copy.sort((a, b) => TYPE_LABELS[a.type].localeCompare(TYPE_LABELS[b.type]) || a.sliceIndex - b.sliceIndex);
-    }
-    if (order === "title-asc") {
-      return copy.sort((a, b) => summaryFor(a).localeCompare(summaryFor(b)));
-    }
-    if (order === "title-desc") {
-      return copy.sort((a, b) => summaryFor(b).localeCompare(summaryFor(a)));
-    }
-    return copy.sort((a, b) => a.sliceIndex - b.sliceIndex);
   }
 
   function renderGlobalList() {
     totalAnnCountEl.textContent = state.annotations.length;
     const sorted = sortAnnotations(state.annotations, sortOrderEl.value);
     allAnnotationListEl.innerHTML = "";
-
     if (!sorted.length) {
       const li = document.createElement("li");
       li.className = "empty";
@@ -548,33 +523,31 @@
       allAnnotationListEl.appendChild(li);
       return;
     }
-
     sorted.forEach((ann) => {
       const li = document.createElement("li");
       if (ann.id === state.selectedId) li.classList.add("active");
       li.innerHTML = `
         ${iconHtmlFor(ann.type)}
         <span class="label-text">${escapeHtml(summaryFor(ann))}</span>
-        <span class="slice-tag">#${ann.sliceIndex}</span>
-      `;
+        <span class="slice-tag">#${rangeLabel(ann)}</span>`;
       li.addEventListener("click", () => navigateToAnnotation(ann.id));
       allAnnotationListEl.appendChild(li);
     });
   }
 
-  // --- inspector ---------------------------------------------------------------
+  // --- inspector ----------------------------------------------------------------------------
 
   function typeFieldsMarkup(ann) {
     if (ann.type === "label") {
       return `
         <label>Label text
-          <input type="text" id="f-text" maxlength="40" value="${escapeHtml(ann.text || "")}" placeholder="e.g. Core" />
+          <input type="text" id="f-text" maxlength="80" value="${escapeHtml(ann.text || "")}" placeholder="e.g. Core" />
         </label>`;
     }
     if (ann.type === "pin") {
       return `
         <label>Title
-          <input type="text" id="f-title" maxlength="60" value="${escapeHtml(ann.title || "")}" placeholder="e.g. Seed chamber" />
+          <input type="text" id="f-title" maxlength="120" value="${escapeHtml(ann.title || "")}" placeholder="e.g. Seed chamber" />
         </label>
         <label>Description
           <textarea id="f-desc" placeholder="Longer explanation for students">${escapeHtml(ann.description || "")}</textarea>
@@ -582,7 +555,7 @@
     }
     return `
       <label>Question
-        <input type="text" id="f-question" value="${escapeHtml(ann.question || "")}" />
+        <input type="text" id="f-question" maxlength="500" value="${escapeHtml(ann.question || "")}" />
       </label>
       <label>Options (one per line)
         <textarea id="f-options">${escapeHtml((ann.options || []).join("\n"))}</textarea>
@@ -592,57 +565,87 @@
       </label>`;
   }
 
-  function toleranceControlsMarkup(ann) {
-    const t = ann.tolerance;
+  function rangeSectionMarkup(ann) {
+    const max = state.manifest.sliceCount;
+    return `
+      <div class="inspector-section" id="rangeSection">
+        <h3 class="section-title">Slices</h3>
+        <div class="row">
+          <label>From <input type="number" id="f-from" min="1" max="${max}" value="${ann.sliceFrom}" /></label>
+          <label>To <input type="number" id="f-to" min="1" max="${max}" value="${ann.sliceTo}" /></label>
+          ${isMultiSlice(ann) ? `<button type="button" id="singleSliceBtn">This slice only</button>` : ""}
+        </div>
+        <p class="hint">A feature that runs through several slices can be set to appear on all of them. The zone is shared unless you adjust it on a particular slice.</p>
+      </div>`;
+  }
 
+  function zoneControlsMarkup(ann) {
+    const zone = viewZone(ann);
+    const t = zone.tolerance;
+    let scopeMarkup = "";
+    if (isMultiSlice(ann)) {
+      const adjusted = Object.keys(ann.overrides).map(Number).sort((a, b) => a - b);
+      const hereAdjusted = hasOverride(ann, state.currentIndex);
+      scopeMarkup = `
+        <div class="row" role="radiogroup" aria-label="Edit zone on">
+          <label><input type="radio" name="editScope" value="all" ${state.editScope === "all" ? "checked" : ""} /> All slices ${rangeLabel(ann)}</label>
+          <label><input type="radio" name="editScope" value="slice" ${state.editScope === "slice" ? "checked" : ""} /> Slice ${state.currentIndex} only</label>
+        </div>
+        ${hereAdjusted ? `<div class="row"><span class="hint" style="margin:0">Slice ${state.currentIndex} has its own zone.</span><button type="button" id="resetOverrideBtn">Reset to shared zone</button></div>` : ""}
+        ${adjusted.length ? `<div><span class="hint">Adjusted on:</span><ul class="adjusted-list">${adjusted.map((i) => `<li><button type="button" class="goto-slice${i === state.currentIndex ? " current" : ""}" data-slice="${i}">${i}</button></li>`).join("")}</ul></div>` : ""}`;
+    }
+
+    let shapeMarkup;
     if (t.mode !== "polygon") {
       const pct = Math.round((t.radius ?? DEFAULT_TOLERANCE.radius) * 100);
-      return `
+      shapeMarkup = `
         <label>Radius <span id="radiusReadout">${pct}%</span>
           <input type="range" id="f-radius" min="2" max="30" step="1" value="${pct}" />
         </label>
         <p class="hint">Students must place their answer within this circle of the slice to be marked correct.</p>`;
-    }
-
-    const drawing = state.drawing && state.drawing.annId === ann.id;
-    const hasPolygon = t.polygon && t.polygon.length >= 3;
-
-    if (drawing) {
-      const n = state.drawing.points.length;
-      return `
-        <p class="hint drawing">Click on the slice to add points (${n} so far, need at least 3).</p>
-        <div class="tolerance-actions">
-          <button id="undoPointBtn" ${n === 0 ? "disabled" : ""}>Undo point</button>
-          <button id="finishShapeBtn" ${n < 3 ? "disabled" : ""}>Finish shape</button>
-          <button id="cancelDrawBtn">Cancel</button>
-        </div>`;
+    } else {
+      const drawing = state.drawing && state.drawing.annId === ann.id;
+      const hasPolygon = t.polygon && t.polygon.length >= 3;
+      if (drawing) {
+        const n = state.drawing.points.length;
+        shapeMarkup = `
+          <p class="hint drawing">Click on the slice to add points (${n} so far, need at least 3).</p>
+          <div class="btn-row">
+            <button type="button" id="undoPointBtn" ${n === 0 ? "disabled" : ""}>Undo point</button>
+            <button type="button" id="finishShapeBtn" ${n < 3 ? "disabled" : ""}>Finish shape</button>
+            <button type="button" id="cancelDrawBtn">Cancel</button>
+          </div>`;
+      } else {
+        shapeMarkup = `
+          <p class="hint">${hasPolygon ? `Custom shape with ${t.polygon.length} points.` : "No custom shape yet — it doesn't need to surround the pin."}</p>
+          <div class="btn-row"><button type="button" id="drawShapeBtn">${hasPolygon ? "Redraw shape" : "Draw shape"}</button></div>`;
+      }
     }
 
     return `
-      <p class="hint">${hasPolygon ? `Custom shape with ${t.polygon.length} points.` : "No custom shape yet — it doesn't need to surround the pin."}</p>
-      <div class="tolerance-actions">
-        <button id="drawShapeBtn">${hasPolygon ? "Redraw shape" : "Draw shape"}</button>
-      </div>`;
+      ${scopeMarkup}
+      <div class="row" role="radiogroup" aria-label="Zone shape">
+        <label><input type="radio" name="tolMode" value="radius" ${t.mode !== "polygon" ? "checked" : ""} /> Radius</label>
+        <label><input type="radio" name="tolMode" value="polygon" ${t.mode === "polygon" ? "checked" : ""} /> Custom shape</label>
+      </div>
+      ${shapeMarkup}`;
   }
 
   function buildInspectorMarkup(ann) {
     return `
       <div class="inspector-header">
         <h2>${TYPE_LABELS[ann.type]}</h2>
-        <button id="closeInspector" title="Close">×</button>
+        <button type="button" id="closeInspector" title="Close" aria-label="Close">×</button>
       </div>
-      <p class="meta">Slice ${ann.sliceIndex} · layer: ${escapeHtml(ann.layer || "unassigned")}</p>
+      <p class="meta">Slice${isMultiSlice(ann) ? "s" : ""} ${rangeLabel(ann)} · layer: ${escapeHtml(ann.layer || "unassigned")}</p>
       ${typeFieldsMarkup(ann)}
-      <div class="tolerance-section">
-        <h3>Acceptable range</h3>
-        <div class="tolerance-mode">
-          <label><input type="radio" name="tolMode" value="radius" ${ann.tolerance.mode !== "polygon" ? "checked" : ""} /> Radius</label>
-          <label><input type="radio" name="tolMode" value="polygon" ${ann.tolerance.mode === "polygon" ? "checked" : ""} /> Custom shape</label>
-        </div>
-        <div id="toleranceControls">${toleranceControlsMarkup(ann)}</div>
+      ${rangeSectionMarkup(ann)}
+      <div class="inspector-section">
+        <h3 class="section-title">Acceptable zone</h3>
+        <div id="zoneControls">${zoneControlsMarkup(ann)}</div>
       </div>
-      <div class="inspector-actions">
-        <button id="deleteBtn" class="danger">Delete</button>
+      <div class="inspector-section inspector-actions">
+        <button type="button" id="deleteBtn" class="danger">Delete</button>
       </div>`;
   }
 
@@ -653,30 +656,68 @@
     renderGlobalList();
   }
 
-  function rebuildToleranceControls(ann) {
-    el("toleranceControls").innerHTML = toleranceControlsMarkup(ann);
-    bindToleranceControlsInner(ann);
+  function rebuildZoneControls(ann) {
+    const host = el("zoneControls");
+    if (!host) return;
+    host.innerHTML = zoneControlsMarkup(ann);
+    bindZoneControls(ann);
   }
 
-  function bindToleranceControlsInner(ann) {
-    if (ann.tolerance.mode !== "polygon") {
-      const slider = el("f-radius");
-      const readoutEl = el("radiusReadout");
-      slider.addEventListener("input", () => {
-        ann.tolerance.radius = Number(slider.value) / 100;
-        readoutEl.textContent = `${slider.value}%`;
-        persist();
+  function bindZoneControls(ann) {
+    document.querySelectorAll('input[name="editScope"]').forEach((radio) => {
+      radio.addEventListener("change", () => {
+        if (!radio.checked) return;
+        cancelDrawing();
+        state.editScope = radio.value;
+        rebuildZoneControls(ann);
         renderToleranceOverlay();
       });
-      return;
+    });
+    const resetBtn = el("resetOverrideBtn");
+    if (resetBtn) {
+      resetBtn.addEventListener("click", () => {
+        delete ann.overrides[state.currentIndex];
+        persist();
+        renderAll();
+      });
     }
+    document.querySelectorAll(".goto-slice").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        const idx = Number(btn.dataset.slice);
+        state.editScope = "slice";
+        await loadSlice(idx);
+      });
+    });
 
+    document.querySelectorAll('input[name="tolMode"]').forEach((radio) => {
+      radio.addEventListener("change", () => {
+        if (!radio.checked) return;
+        const target = editTarget(ann);
+        target.tolerance.mode = radio.value;
+        persist();
+        rebuildZoneControls(ann);
+        renderToleranceOverlay();
+      });
+    });
+
+    const slider = el("f-radius");
+    if (slider) {
+      const readoutEl = el("radiusReadout");
+      slider.addEventListener("input", () => {
+        const target = editTarget(ann);
+        target.tolerance.radius = Number(slider.value) / 100;
+        readoutEl.textContent = `${slider.value}%`;
+        persist();
+        renderMarkers();
+        renderToleranceOverlay();
+      });
+    }
     const drawBtn = el("drawShapeBtn");
     if (drawBtn) {
       drawBtn.addEventListener("click", () => {
         state.drawing = { annId: ann.id, points: [] };
         stage.classList.add("drawing-mode");
-        rebuildToleranceControls(ann);
+        rebuildZoneControls(ann);
         renderToleranceOverlay();
       });
     }
@@ -684,27 +725,27 @@
     if (undoBtn) {
       undoBtn.addEventListener("click", () => {
         state.drawing.points.pop();
-        rebuildToleranceControls(ann);
+        rebuildZoneControls(ann);
         renderToleranceOverlay();
       });
     }
     const finishBtn = el("finishShapeBtn");
     if (finishBtn) {
       finishBtn.addEventListener("click", () => {
-        ann.tolerance.polygon = state.drawing.points.slice();
-        ann.tolerance.mode = "polygon";
+        const target = editTarget(ann);
+        target.tolerance.polygon = state.drawing.points.slice();
+        target.tolerance.mode = "polygon";
         state.drawing = null;
         stage.classList.remove("drawing-mode");
         persist();
-        rebuildToleranceControls(ann);
-        renderToleranceOverlay();
+        renderAll();
       });
     }
     const cancelBtn = el("cancelDrawBtn");
     if (cancelBtn) {
       cancelBtn.addEventListener("click", () => {
         cancelDrawing();
-        rebuildToleranceControls(ann);
+        rebuildZoneControls(ann);
         renderToleranceOverlay();
       });
     }
@@ -713,34 +754,19 @@
   function wireInspector(ann) {
     el("closeInspector").addEventListener("click", deselectAnnotation);
     el("deleteBtn").addEventListener("click", () => {
-      removeAnnotation(ann.id);
+      state.annotations = state.annotations.filter((a) => a.id !== ann.id);
       persist();
       deselectAnnotation();
-      renderMarkers();
-      renderToleranceOverlay();
-      renderAnnotationList();
-      renderGlobalList();
+      renderAll();
     });
 
     if (ann.type === "label") {
-      el("f-text").addEventListener("input", (e) => {
-        ann.text = e.target.value;
-        afterFieldChange();
-      });
+      el("f-text").addEventListener("input", (e) => { ann.text = e.target.value; afterFieldChange(); });
     } else if (ann.type === "pin") {
-      el("f-title").addEventListener("input", (e) => {
-        ann.title = e.target.value;
-        afterFieldChange();
-      });
-      el("f-desc").addEventListener("input", (e) => {
-        ann.description = e.target.value;
-        afterFieldChange();
-      });
+      el("f-title").addEventListener("input", (e) => { ann.title = e.target.value; afterFieldChange(); });
+      el("f-desc").addEventListener("input", (e) => { ann.description = e.target.value; afterFieldChange(); });
     } else {
-      el("f-question").addEventListener("input", (e) => {
-        ann.question = e.target.value;
-        afterFieldChange();
-      });
+      el("f-question").addEventListener("input", (e) => { ann.question = e.target.value; afterFieldChange(); });
       const optionsTa = el("f-options");
       const answerSel = el("f-answer");
       const refreshOptions = (notify) => {
@@ -754,48 +780,59 @@
       };
       refreshOptions(false);
       optionsTa.addEventListener("input", () => refreshOptions(true));
-      answerSel.addEventListener("change", () => {
-        ann.answer = answerSel.value;
-        afterFieldChange();
+      answerSel.addEventListener("change", () => { ann.answer = answerSel.value; afterFieldChange(); });
+    }
+
+    const fromEl = el("f-from");
+    const toEl = el("f-to");
+    const applyRange = () => {
+      setRange(ann, Number(fromEl.value), Number(toEl.value));
+      persist();
+      renderAll();
+    };
+    fromEl.addEventListener("change", applyRange);
+    toEl.addEventListener("change", applyRange);
+    const singleBtn = el("singleSliceBtn");
+    if (singleBtn) {
+      singleBtn.addEventListener("click", () => {
+        const here = appliesToSlice(ann, state.currentIndex) ? state.currentIndex : ann.sliceFrom;
+        const keep = zoneFor(ann, here);
+        ann.x = keep.x;
+        ann.y = keep.y;
+        ann.tolerance = JSON.parse(JSON.stringify(keep.tolerance));
+        ann.overrides = {};
+        setRange(ann, here, here);
+        persist();
+        renderAll();
       });
     }
 
-    document.querySelectorAll('input[name="tolMode"]').forEach((radio) => {
-      radio.addEventListener("change", () => {
-        if (!radio.checked) return;
-        ann.tolerance.mode = radio.value;
-        persist();
-        rebuildToleranceControls(ann);
-        renderToleranceOverlay();
-      });
-    });
-    bindToleranceControlsInner(ann);
+    bindZoneControls(ann);
   }
 
   function renderInspector() {
-    const ann = state.annotations.find((a) => a.id === state.selectedId);
+    const ann = findAnn(state.selectedId);
     if (!ann) {
+      inspectorEl.dataset.annId = "";
+      inspectorEl.dataset.signature = "";
       inspectorEl.innerHTML = `<p class="hint placeholder">Select an annotation on the slice, or drag a new one from the palette, to edit it here.</p>`;
       return;
     }
+    // Rebuilding the inspector while typing would steal focus; only rebuild
+    // when the selected annotation changed or when the structure must change.
+    const sameAnn = inspectorEl.dataset.annId === ann.id;
+    const signature = `${ann.id}|${ann.sliceFrom}|${ann.sliceTo}|${state.currentIndex}|${state.editScope}|${Object.keys(ann.overrides).join(",")}|${viewZone(ann).tolerance.mode}|${state.drawing ? "d" : ""}`;
+    if (sameAnn && inspectorEl.dataset.signature === signature && document.activeElement && inspectorEl.contains(document.activeElement)) return;
+    inspectorEl.dataset.annId = ann.id;
+    inspectorEl.dataset.signature = signature;
     inspectorEl.innerHTML = buildInspectorMarkup(ann);
     wireInspector(ann);
   }
 
-  // --- export (with quiz/showcase prompt) ---------------------------------------
+  // --- export -----------------------------------------------------------------------------------
 
   function downloadAnnotations(exportMode, quizMode) {
-    const payload = {
-      version: 2,
-      exportMode,
-      ...(exportMode === "quiz" ? { quizMode } : {}),
-      dataset: {
-        size: state.manifest.size,
-        sliceCount: state.manifest.sliceCount,
-        axis: state.manifest.axis,
-      },
-      annotations: state.annotations,
-    };
+    const payload = S.buildExport({ manifest: state.manifest, annotations: state.annotations, exportMode, quizMode });
     const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
@@ -804,36 +841,37 @@
     document.body.appendChild(a);
     a.click();
     a.remove();
-    URL.revokeObjectURL(url);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
   function openExportModal() {
     const backdrop = document.createElement("div");
     backdrop.className = "modal-backdrop open";
     backdrop.innerHTML = `
-      <div class="modal">
-        <h3>Export annotations</h3>
+      <div class="modal" role="dialog" aria-modal="true" aria-labelledby="exportTitle">
+        <h3 id="exportTitle">Export annotations</h3>
         <fieldset>
           <legend>What are you exporting this for?</legend>
           <label><input type="radio" name="exportMode" value="quiz" checked />
-            <span><strong>Quiz</strong><br />Students place features themselves and get checked.</span>
+            <span><strong>Quiz</strong><br /><em>Students place features themselves and get checked.</em></span>
           </label>
           <label><input type="radio" name="exportMode" value="showcase" />
-            <span><strong>Showcase</strong><br />Read-only walkthrough of the annotated slices.</span>
+            <span><strong>Showcase</strong><br /><em>Read-only walkthrough of the annotated slices.</em></span>
           </label>
         </fieldset>
         <fieldset id="quizModeFieldset">
           <legend>How much should students be told?</legend>
           <label><input type="radio" name="quizMode" value="full" checked />
-            <span><strong>Full challenge</strong><br />Find the right slice <em>and</em> the right spot.</span>
+            <span><strong>Full challenge</strong><br /><em>Find the right slice and the right spot. Slice hints appear only after a miss.</em></span>
           </label>
           <label><input type="radio" name="quizMode" value="guided" />
-            <span><strong>Guided</strong><br />Shown which slice each feature is on, only need to find the spot.</span>
+            <span><strong>Guided</strong><br /><em>Shown which slices each feature is on from the start; only the spot is tested.</em></span>
           </label>
         </fieldset>
+        <p class="hint">${state.manifest.datasetHash ? "The export carries this image stack's fingerprint, so the quiz can warn if the images change." : "This image stack has no fingerprint; the export can't be checked against it later."}</p>
         <div class="modal-actions">
-          <button id="exportCancelBtn">Cancel</button>
-          <button id="exportDownloadBtn">Download</button>
+          <button type="button" id="exportCancelBtn">Cancel</button>
+          <button type="button" id="exportDownloadBtn" class="primary">Download</button>
         </div>
       </div>`;
     document.body.appendChild(backdrop);
@@ -841,11 +879,9 @@
     const quizModeFieldset = backdrop.querySelector("#quizModeFieldset");
     backdrop.querySelectorAll('input[name="exportMode"]').forEach((radio) => {
       radio.addEventListener("change", () => {
-        if (!radio.checked) return;
-        quizModeFieldset.style.display = radio.value === "quiz" ? "" : "none";
+        if (radio.checked) quizModeFieldset.style.display = radio.value === "quiz" ? "" : "none";
       });
     });
-
     const close = () => {
       backdrop.remove();
       document.removeEventListener("keydown", onKey);
@@ -854,11 +890,8 @@
       if (e.key === "Escape") close();
     }
     backdrop.querySelector("#exportCancelBtn").addEventListener("click", close);
-    backdrop.addEventListener("click", (e) => {
-      if (e.target === backdrop) close();
-    });
+    backdrop.addEventListener("click", (e) => { if (e.target === backdrop) close(); });
     document.addEventListener("keydown", onKey);
-
     backdrop.querySelector("#exportDownloadBtn").addEventListener("click", () => {
       const exportMode = backdrop.querySelector('input[name="exportMode"]:checked').value;
       const quizMode = backdrop.querySelector('input[name="quizMode"]:checked').value;
@@ -867,71 +900,87 @@
     });
   }
 
-  // --- import / export / clear -------------------------------------------------
+  // --- import -----------------------------------------------------------------------------------
+
+  async function importAnnotationsFile(file) {
+    let data;
+    try {
+      data = JSON.parse(await file.text());
+    } catch (err) {
+      S.notify("error", `Could not import ${file.name}: the file is not valid JSON.`, { id: "import" });
+      return;
+    }
+    const parsed = S.parseExportFile(data, state.manifest.sliceCount);
+    if (parsed.error) {
+      S.notify("error", `Could not import ${file.name}: ${parsed.error}.`, { id: "import" });
+      return;
+    }
+    const imported = parsed.file;
+
+    const check = S.compareDataset(imported, state.manifest);
+    if (check.status !== "match") {
+      const ok = await S.confirmDialog({
+        title: check.status === "mismatch" ? "This file may be for a different image stack" : "This file can't be verified",
+        message: `${check.message} Import it anyway?`,
+        confirmLabel: "Import anyway",
+        danger: check.status === "mismatch",
+      });
+      if (!ok) return;
+    }
+    if (state.annotations.length) {
+      const ok = await S.confirmDialog({
+        title: "Replace current annotations?",
+        message: `Importing replaces the ${state.annotations.length} annotation${state.annotations.length === 1 ? "" : "s"} currently loaded.`,
+        confirmLabel: "Replace",
+        danger: true,
+      });
+      if (!ok) return;
+    }
+
+    state.annotations = imported.annotations;
+    deselectAnnotation();
+    persist();
+    renderAll();
+    S.dismissNotice("import");
+    if (imported.rejected.length) {
+      S.notify("warn", `Imported ${imported.annotations.length} annotations; ${imported.rejected.length} entr${imported.rejected.length === 1 ? "y was" : "ies were"} skipped (${S.describeRejected(imported.rejected)}).`, { id: "import" });
+    } else if (imported.version < S.SCHEMA_VERSION) {
+      S.notify("info", `Imported ${imported.annotations.length} annotations from an older export format; they will be saved in the current format.`, { id: "import" });
+    }
+  }
+
+  // --- global wiring -----------------------------------------------------------------------------
 
   function wireGlobalControls() {
     wirePalette();
 
     scrub.addEventListener("input", () => {
-      stopPlaying();
+      state.player.stop();
       loadSlice(Number(scrub.value));
     });
-
-    playBtn.addEventListener("click", () => {
-      if (state.playing) {
-        stopPlaying();
-        return;
-      }
-      state.playing = true;
-      playBtn.textContent = "Pause";
-      state.playTimer = setInterval(() => {
-        let next = state.currentIndex + 1;
-        if (next > state.manifest.sliceCount) next = 1;
-        loadSlice(next);
-      }, 300);
-    });
-
+    playBtn.addEventListener("click", () => state.player.toggle());
     sortOrderEl.addEventListener("change", renderGlobalList);
-
     exportBtn.addEventListener("click", openExportModal);
-
     importBtn.addEventListener("click", () => importFile.click());
-
     importFile.addEventListener("change", async () => {
       const file = importFile.files[0];
-      if (!file) return;
-      try {
-        const parsed = JSON.parse(await file.text());
-        if (!parsed || !Array.isArray(parsed.annotations)) throw new Error("Missing annotations array");
-        if (state.annotations.length && !confirm("Replace current annotations with the imported file?")) return;
-        state.annotations = parsed.annotations.map((a) => {
-          const ann = { ...a, id: a.id || uid() };
-          normalizeTolerance(ann);
-          return ann;
-        });
-        deselectAnnotation();
-        persist();
-        renderMarkers();
-        renderToleranceOverlay();
-        renderAnnotationList();
-        renderGlobalList();
-      } catch (err) {
-        alert("Could not import file: " + err.message);
-      } finally {
-        importFile.value = "";
-      }
+      if (file) await importAnnotationsFile(file);
+      importFile.value = "";
     });
 
-    clearBtn.addEventListener("click", () => {
+    clearBtn.addEventListener("click", async () => {
       if (!state.annotations.length) return;
-      if (!confirm("Delete all annotations across every slice? This cannot be undone.")) return;
+      const ok = await S.confirmDialog({
+        title: "Delete all annotations?",
+        message: "This removes every annotation on every slice. It cannot be undone.",
+        confirmLabel: "Delete all",
+        danger: true,
+      });
+      if (!ok) return;
       state.annotations = [];
       deselectAnnotation();
       persist();
-      renderMarkers();
-      renderToleranceOverlay();
-      renderAnnotationList();
-      renderGlobalList();
+      renderAll();
     });
 
     document.addEventListener("keydown", (e) => {
