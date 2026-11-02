@@ -125,6 +125,7 @@ button {
   font: inherit;
   font-size: 0.85rem;
 }
+button { min-width: 24px; min-height: 24px; }
 button:hover { background: var(--bg-control-hover); }
 button:disabled { opacity: 0.5; cursor: not-allowed; }
 button.danger { border-color: var(--danger-border); color: var(--danger-text); }
@@ -164,7 +165,8 @@ button.primary:hover { background: var(--primary-bg-hover); }
 .notice .notice-hint { font-size: 0.8rem; opacity: 0.9; }
 .notice code { font-size: 0.8rem; }
 .notice-close {
-  padding: 0 0.45rem;
+  padding: 0 0.5rem;
+  min-height: 28px;
   font-size: 1rem;
   line-height: 1.4;
   background: transparent;
@@ -188,7 +190,6 @@ main {
   main { grid-template-columns: 1fr; }
   /* Stacked layout already scrolls as a page - an inner scroll region on
      top of that just fights the user's finger. */
-  .inspector { max-height: none; overflow-y: visible; }
 }
 
 .panel {
@@ -270,8 +271,6 @@ select,
   display: flex;
   flex-direction: column;
   gap: 0.4rem;
-  max-height: 300px;
-  overflow-y: auto;
 }
 .annotation-list li {
   display: flex;
@@ -325,6 +324,11 @@ select,
 /* --- stage ----------------------------------------------------------------- */
 
 .stage-panel { display: flex; flex-direction: column; align-items: center; gap: 1rem; }
+/* On the three-column layout the stage stays in view while a long
+   inspector scrolls the page, so drawing never scrolls the image away. */
+@media (min-width: 1101px) {
+  .stage-panel { position: sticky; top: 1rem; }
+}
 .stage-wrap { width: min(65vh, 100%); }
 
 .stage {
@@ -387,20 +391,26 @@ select,
 
 .marker-layer { position: absolute; inset: 0; pointer-events: none; }
 
+/* Every marker is a 24px (32px on touch) box centred on its (x,y) point,
+   so the hit target meets WCAG 2.5.8 however small the glyph inside is. */
 .marker {
   position: absolute;
   transform: translate(-50%, -50%);
+  min-width: 24px;
+  min-height: 24px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   cursor: grab;
   pointer-events: auto;
   touch-action: none;
 }
 .marker:active { cursor: grabbing; }
-.marker.pin, .marker.mcq, .marker.mcq-fixed { display: flex; align-items: center; }
 
 /* Label markers: the dot alone anchors the (x,y) point (so the zone, which
    is centred on that same point, lines up with the dot) - the chip hangs
-   off it via absolute positioning so it doesn't pull the anchor sideways. */
-.marker.label { display: block; }
+   off the marker box via absolute positioning so it doesn't pull the
+   anchor sideways. */
 
 .marker .dot {
   width: 12px;
@@ -443,9 +453,9 @@ select,
 .marker.overridden .dot,
 .marker.overridden .icon-circle { box-shadow: 0 0 0 2px var(--bg-stage), 0 0 0 4px var(--tick-active); }
 
-.controls { display: flex; align-items: center; gap: 0.75rem; width: 100%; }
-.slider-wrap { flex: 1; display: flex; flex-direction: column; gap: 3px; }
-input[type="range"] { flex: 1; width: 100%; }
+.controls { display: flex; align-items: center; gap: 0.75rem; width: 100%; flex-wrap: wrap; }
+.slider-wrap { flex: 1; min-width: 140px; display: flex; flex-direction: column; gap: 3px; }
+input[type="range"] { flex: 1; min-width: 140px; width: 100%; min-height: 24px; }
 .readout { min-width: 6ch; text-align: right; font-variant-numeric: tabular-nums; }
 
 .tick-row { position: relative; height: 6px; }
@@ -465,16 +475,16 @@ input[type="range"] { flex: 1; width: 100%; }
 
 /* --- inspector ------------------------------------------------------------- */
 
+/* Panels grow with their content and the page scrolls; nothing hides
+   behind an inner scrollbar. */
 .inspector {
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
-  max-height: calc(100vh - 6rem);
-  overflow-y: auto;
 }
 .inspector-header { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
 .inspector-header h2 { margin: 0; font-size: 1rem; }
-.inspector-header button { padding: 0.1rem 0.5rem; font-size: 1rem; line-height: 1; }
+.inspector-header button { padding: 0.1rem 0.5rem; font-size: 1rem; line-height: 1; min-height: 28px; }
 
 .inspector .meta { font-size: 0.8rem; color: var(--text-muted); margin: -0.4rem 0 0; }
 .inspector .prompt { font-size: 0.95rem; font-weight: 600; margin: 0; }
@@ -517,10 +527,67 @@ input[type="range"] { flex: 1; width: 100%; }
 
 .inspector .row { display: flex; gap: 0.5rem; align-items: center; flex-wrap: wrap; }
 .inspector .row label { flex-direction: row; align-items: center; gap: 0.35rem; cursor: pointer; }
-.inspector .row input[type="number"] { width: 5ch; padding: 0.3rem 0.4rem; }
+/* Wide enough for three digits plus Firefox's always-visible spinner. */
+.inspector .row input[type="number"] { width: 5.5rem; padding: 0.3rem 0.4rem; }
 .inspector .btn-row { display: flex; flex-wrap: wrap; gap: 0.5rem; }
 .inspector .btn-row button { font-size: 0.8rem; padding: 0.35rem 0.6rem; }
 .inspector-actions { display: flex; justify-content: flex-end; }
+
+/* Grouped choices (edit scope, shape) are fieldsets so the group reads as
+   one control with a visible name, and the two groups never run together. */
+fieldset.choice {
+  border: 1px solid var(--border-item);
+  border-radius: 8px;
+  padding: 0.5rem 0.65rem 0.6rem;
+  margin: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem 1rem;
+}
+fieldset.choice legend {
+  padding: 0 0.3rem;
+  font-size: 0.75rem;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+}
+fieldset.choice label { flex-direction: row; align-items: center; gap: 0.4rem; cursor: pointer; min-height: 24px; }
+.inspector label.inline { flex-direction: row; align-items: center; gap: 0.4rem; }
+
+/* Slice strip: one chip per slice in range. */
+.slice-strip { list-style: none; margin: 0; padding: 0; display: flex; flex-wrap: wrap; gap: 0.3rem; }
+.slice-chip {
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0.15rem 0.4rem;
+  font-size: 0.78rem;
+  font-variant-numeric: tabular-nums;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+}
+.slice-chip.current { border-color: var(--accent-strong); background: var(--bg-active); box-shadow: inset 0 0 0 1px var(--accent-strong); }
+.slice-chip.custom { border-style: dashed; border-color: var(--tick-active); }
+.custom-mark { color: var(--tick-active); font-weight: 700; }
+.legend-hint { margin: 0; }
+.status-line { margin: 0; }
+
+.stage-badge {
+  position: absolute;
+  top: 0.5rem;
+  left: 0.5rem;
+  padding: 0.25rem 0.55rem;
+  border-radius: 6px;
+  background: var(--warn-bg);
+  border: 1px solid var(--warn-border);
+  color: var(--warn-text);
+  font-size: 0.78rem;
+  font-weight: 600;
+  pointer-events: none;
+  z-index: 5;
+}
+.stage-badge[hidden] { display: none; }
 
 .inspector .options-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.35rem; }
 .inspector .options-list li {
@@ -601,10 +668,15 @@ input[type="range"] { flex: 1; width: 100%; }
 /* Touchscreens (phones, iPads, incl. wide iPad landscape that would
    otherwise still match the desktop 3-column layout): bigger hit targets. */
 @media (pointer: coarse) {
-  button { padding: 0.6rem 0.9rem; font-size: 0.9rem; }
+  button { padding: 0.6rem 0.9rem; font-size: 0.9rem; min-width: 32px; min-height: 32px; }
+  .inspector-header button { padding: 0.1rem 0.6rem; min-height: 32px; min-width: 32px; }
+  .inspector input, .inspector select, .inspector textarea, select, input[type="range"],
+  fieldset.choice label, .inspector .row label, .inspector label.inline, .mcq-options label { min-height: 32px; }
+  .marker { min-width: 32px; min-height: 32px; }
   .marker .dot { width: 16px; height: 16px; }
   .marker .icon-circle { width: 30px; height: 30px; font-size: 14px; }
   input[type="range"] { height: 1.5rem; }
+  .slice-chip { min-width: 32px; min-height: 32px; }
 }
 
 @media (max-width: 640px) {

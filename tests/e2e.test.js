@@ -417,6 +417,100 @@ test("annotator: range, per-slice override and export carry through to the file"
   assert.strictEqual(ann.tolerance.radius, 0.06, "default zone must be untouched");
 });
 
+test("per-slice shapes: draw on one slice, copy to a neighbour, use on all, reset", async ({ page, site }) => {
+  await page.goto(`${site.base}/annotator/index.html`);
+  await page.waitForSelector("#svgHost svg");
+  await page.click('.palette-item[data-type="pin"]');
+  await stageClick(page, 0.5, 0.5);
+  await page.waitForSelector("#f-to");
+  await page.fill("#f-to", "21");
+  await page.$eval("#f-to", (e) => e.dispatchEvent(new Event("change")));
+  await page.waitForSelector("#f-from");
+  await page.fill("#f-from", "16");
+  await page.$eval("#f-from", (e) => e.dispatchEvent(new Event("change")));
+  await page.waitForSelector(".slice-chip");
+  assert.deepStrictEqual(await page.$$eval(".slice-chip", (c) => c.map((x) => x.dataset.slice)), ["16", "17", "18", "19", "20", "21"]);
+
+  // Draw a polygon on slice 18 only.
+  await page.click('.slice-chip[data-slice="18"]');
+  await waitReadout(page, 18);
+  await page.click('input[name="editScope"][value="slice"]');
+  assert.strictEqual(await page.textContent("#stageBadge"), "Editing slice 18 only");
+  await page.click('input[name="tolMode"][value="polygon"]');
+  await page.click("#drawShapeBtn");
+  await page.evaluate(() => window.scrollTo(0, 0));
+  for (const [fx, fy] of [[0.3, 0.3], [0.7, 0.3], [0.5, 0.7]]) await stageClick(page, fx, fy);
+  await page.click("#finishShapeBtn");
+  await page.waitForSelector(".slice-chip.custom");
+  assert.deepStrictEqual(await page.$$eval(".slice-chip.custom", (c) => c.map((x) => x.dataset.slice)), ["18"]);
+  const saved = () => page.evaluate(() => JSON.parse(localStorage.getItem(Object.keys(localStorage).find((k) => k.startsWith("annotator:"))))[0]);
+  let ann = await saved();
+  assert.strictEqual(ann.overrides["18"].tolerance.mode, "polygon");
+  assert.strictEqual(ann.tolerance.mode, "radius", "shared zone must stay a radius");
+
+  // Copy 18's shape to 19.
+  await page.click('.slice-chip[data-slice="19"]');
+  await waitReadout(page, 19);
+  await page.selectOption("#copyFromSel", "18");
+  await page.click("#copyFromBtn");
+  await page.waitForFunction(() => document.querySelectorAll(".slice-chip.custom").length === 2);
+  ann = await saved();
+  assert.strictEqual(ann.overrides["19"].tolerance.polygon.length, 3);
+
+  // Make 19's shape the shared one; 18 keeps its own.
+  await page.click("#useOnAllBtn");
+  await page.waitForFunction(() => document.querySelectorAll(".slice-chip.custom").length === 1);
+  ann = await saved();
+  assert.strictEqual(ann.tolerance.mode, "polygon");
+  assert.deepStrictEqual(Object.keys(ann.overrides), ["18"]);
+
+  // Reset 18.
+  await page.click('.slice-chip[data-slice="18"]');
+  await waitReadout(page, 18);
+  await page.click('input[name="editScope"][value="slice"]');
+  await page.click("#resetOverrideBtn");
+  await page.waitForFunction(() => document.querySelectorAll(".slice-chip.custom").length === 0);
+});
+
+test("per-slice polygons grade each slice against its own shape", async ({ page, site }) => {
+  site.write("quiz/annotations.json", quizFile(site, [{
+    id: "organ", type: "label", sliceFrom: 16, sliceTo: 18, x: 0.5, y: 0.5, text: "Organ",
+    tolerance: { mode: "polygon", polygon: [{ x: 0.4, y: 0.4 }, { x: 0.6, y: 0.4 }, { x: 0.6, y: 0.6 }, { x: 0.4, y: 0.6 }] },
+    overrides: { 18: { x: 0.2, y: 0.2, tolerance: { mode: "polygon", polygon: [{ x: 0.1, y: 0.1 }, { x: 0.3, y: 0.1 }, { x: 0.3, y: 0.3 }, { x: 0.1, y: 0.3 }] } } },
+  }]));
+  await page.goto(`${site.base}/quiz/index.html`);
+  await page.waitForSelector("#startBtn");
+  await page.click("#startBtn");
+  await setSlider(page, 17);
+  await waitReadout(page, 17);
+  await stageClick(page, 0.5, 0.5);
+  await page.click("#checkBtn");
+  await page.waitForSelector(".outcome-banner.correct");
+  await page.click("#nextBtn");
+  await page.click('[data-retry="organ"]');
+  await setSlider(page, 18);
+  await waitReadout(page, 18);
+  await stageClick(page, 0.5, 0.5); // shared square does not apply here
+  await page.click("#checkBtn");
+  await page.waitForSelector(".outcome-banner.incorrect");
+  await stageClick(page, 0.2, 0.2);
+  await page.click("#checkBtn");
+  await page.waitForSelector(".outcome-banner.correct");
+});
+
+test("moving one end of the slice range past the other drags it along", async ({ page, site }) => {
+  await page.goto(`${site.base}/annotator/index.html`);
+  await page.waitForSelector("#svgHost svg");
+  await setSlider(page, 10);
+  await waitReadout(page, 10);
+  await page.click('.palette-item[data-type="label"]');
+  await stageClick(page, 0.5, 0.5);
+  await page.waitForSelector("#f-from");
+  await page.fill("#f-from", "15");
+  await page.$eval("#f-from", (e) => e.dispatchEvent(new Event("change")));
+  await page.waitForFunction(() => /#15$/.test(document.querySelector("#allAnnotationList .slice-tag").textContent));
+});
+
 // --- run -------------------------------------------------------------------------------------
 
 (async () => {

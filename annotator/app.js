@@ -133,7 +133,12 @@
     state.currentIndex = index;
     if (state.selectedId) {
       const sel = findAnn(state.selectedId);
-      if (!sel || !appliesToSlice(sel, index)) state.selectedId = null;
+      // Keep a multi-slice annotation selected while browsing its range so
+      // the per-slice controls stay usable; drop the selection otherwise.
+      if (!sel || !appliesToSlice(sel, index)) {
+        state.selectedId = null;
+        state.editScope = "all";
+      }
     }
     scrub.value = index;
     readout.textContent = `${index} / ${state.manifest.sliceCount}`;
@@ -575,25 +580,58 @@
           <label>To <input type="number" id="f-to" min="1" max="${max}" value="${ann.sliceTo}" /></label>
           ${isMultiSlice(ann) ? `<button type="button" id="singleSliceBtn">This slice only</button>` : ""}
         </div>
-        <p class="hint">A feature that runs through several slices can be set to appear on all of them. The zone is shared unless you adjust it on a particular slice.</p>
+        <p class="hint">A feature that runs through several slices can be set to appear on all of them. It shares one zone unless you give a slice its own.</p>
+      </div>`;
+  }
+
+  function cloneZone(zone) {
+    return { x: zone.x, y: zone.y, tolerance: JSON.parse(JSON.stringify(zone.tolerance)) };
+  }
+
+  // Per-slice section: the strip of slices in range, the edit-scope choice,
+  // and the copy / use-on-all / reset actions for the current slice.
+  function perSliceMarkup(ann) {
+    if (!isMultiSlice(ann)) return "";
+    const here = state.currentIndex;
+    const inRange = appliesToSlice(ann, here);
+    const customHere = hasOverride(ann, here);
+    const chips = [];
+    for (let i = ann.sliceFrom; i <= ann.sliceTo; i++) {
+      const custom = hasOverride(ann, i);
+      chips.push(`<li><button type="button" class="slice-chip${i === here ? " current" : ""}${custom ? " custom" : ""}" data-slice="${i}"
+        aria-label="Slice ${i}${custom ? ", own zone" : ", shared zone"}${i === here ? ", current" : ""}" aria-pressed="${i === here}">${i}${custom ? `<span class="custom-mark" aria-hidden="true">•</span>` : ""}</button></li>`);
+    }
+    const sources = [];
+    if (customHere || state.editScope === "slice") sources.push(`<option value="shared">the shared zone</option>`);
+    Object.keys(ann.overrides).map(Number).sort((x, y) => x - y).forEach((i) => {
+      if (i !== here) sources.push(`<option value="${i}">slice ${i}</option>`);
+    });
+    const scopeDisabled = inRange ? "" : "disabled";
+    return `
+      <div class="inspector-section" id="perSliceSection">
+        <h3 class="section-title">Zone per slice</h3>
+        <ul class="slice-strip" aria-label="Slices in range">${chips.join("")}</ul>
+        <p class="hint legend-hint"><span class="custom-mark" aria-hidden="true">•</span> = has its own zone</p>
+        <fieldset class="choice" id="scopeFieldset">
+          <legend>Edit the zone on</legend>
+          <label><input type="radio" name="editScope" value="all" ${state.editScope === "all" ? "checked" : ""} /> All slices (the shared zone)</label>
+          <label><input type="radio" name="editScope" value="slice" ${state.editScope === "slice" ? "checked" : ""} ${scopeDisabled} /> Slice ${here} only${inRange ? "" : " (not in range)"}</label>
+        </fieldset>
+        ${inRange ? `<p class="hint status-line">Slice ${here} ${customHere ? "has its own zone." : "uses the shared zone."}</p>` : ""}
+        ${inRange ? `
+        <div class="btn-row">
+          ${sources.length ? `<label class="inline">Copy from <select id="copyFromSel">${sources.join("")}</select></label><button type="button" id="copyFromBtn">Copy to slice ${here}</button>` : ""}
+          ${customHere ? `<button type="button" id="useOnAllBtn">Use on all slices</button><button type="button" id="resetOverrideBtn">Reset to shared</button>` : ""}
+        </div>` : ""}
       </div>`;
   }
 
   function zoneControlsMarkup(ann) {
     const zone = viewZone(ann);
     const t = zone.tolerance;
-    let scopeMarkup = "";
-    if (isMultiSlice(ann)) {
-      const adjusted = Object.keys(ann.overrides).map(Number).sort((a, b) => a - b);
-      const hereAdjusted = hasOverride(ann, state.currentIndex);
-      scopeMarkup = `
-        <div class="row" role="radiogroup" aria-label="Edit zone on">
-          <label><input type="radio" name="editScope" value="all" ${state.editScope === "all" ? "checked" : ""} /> All slices ${rangeLabel(ann)}</label>
-          <label><input type="radio" name="editScope" value="slice" ${state.editScope === "slice" ? "checked" : ""} /> Slice ${state.currentIndex} only</label>
-        </div>
-        ${hereAdjusted ? `<div class="row"><span class="hint" style="margin:0">Slice ${state.currentIndex} has its own zone.</span><button type="button" id="resetOverrideBtn">Reset to shared zone</button></div>` : ""}
-        ${adjusted.length ? `<div><span class="hint">Adjusted on:</span><ul class="adjusted-list">${adjusted.map((i) => `<li><button type="button" class="goto-slice${i === state.currentIndex ? " current" : ""}" data-slice="${i}">${i}</button></li>`).join("")}</ul></div>` : ""}`;
-    }
+    const scopeNote = isMultiSlice(ann)
+      ? `<p class="hint">${state.editScope === "slice" ? `Editing slice ${state.currentIndex} only.` : `Editing the shared zone (slices ${rangeLabel(ann)}).`}</p>`
+      : "";
 
     let shapeMarkup;
     if (t.mode !== "polygon") {
@@ -623,11 +661,12 @@
     }
 
     return `
-      ${scopeMarkup}
-      <div class="row" role="radiogroup" aria-label="Zone shape">
+      ${scopeNote}
+      <fieldset class="choice">
+        <legend>Shape</legend>
         <label><input type="radio" name="tolMode" value="radius" ${t.mode !== "polygon" ? "checked" : ""} /> Radius</label>
         <label><input type="radio" name="tolMode" value="polygon" ${t.mode === "polygon" ? "checked" : ""} /> Custom shape</label>
-      </div>
+      </fieldset>
       ${shapeMarkup}`;
   }
 
@@ -640,6 +679,7 @@
       <p class="meta">Slice${isMultiSlice(ann) ? "s" : ""} ${rangeLabel(ann)} · layer: ${escapeHtml(ann.layer || "unassigned")}</p>
       ${typeFieldsMarkup(ann)}
       ${rangeSectionMarkup(ann)}
+      <div id="perSlice">${perSliceMarkup(ann)}</div>
       <div class="inspector-section">
         <h3 class="section-title">Acceptable zone</h3>
         <div id="zoneControls">${zoneControlsMarkup(ann)}</div>
@@ -660,10 +700,22 @@
     const host = el("zoneControls");
     if (!host) return;
     host.innerHTML = zoneControlsMarkup(ann);
+    const per = el("perSlice");
+    if (per) per.innerHTML = perSliceMarkup(ann);
     bindZoneControls(ann);
+    renderStageBadge(ann);
+  }
+
+  function renderStageBadge(ann) {
+    const badge = el("stageBadge");
+    if (!badge) return;
+    const on = ann && isMultiSlice(ann) && state.editScope === "slice";
+    badge.hidden = !on;
+    badge.textContent = on ? `Editing slice ${state.currentIndex} only` : "";
   }
 
   function bindZoneControls(ann) {
+    const here = state.currentIndex;
     document.querySelectorAll('input[name="editScope"]').forEach((radio) => {
       radio.addEventListener("change", () => {
         if (!radio.checked) return;
@@ -673,21 +725,44 @@
         renderToleranceOverlay();
       });
     });
-    const resetBtn = el("resetOverrideBtn");
-    if (resetBtn) {
-      resetBtn.addEventListener("click", () => {
-        delete ann.overrides[state.currentIndex];
+    document.querySelectorAll(".slice-chip").forEach((btn) => {
+      btn.addEventListener("click", async () => {
+        await loadSlice(Number(btn.dataset.slice));
+      });
+    });
+    const copyBtn = el("copyFromBtn");
+    if (copyBtn) {
+      copyBtn.addEventListener("click", () => {
+        const sel = el("copyFromSel").value;
+        const source = sel === "shared" ? ann : ann.overrides[Number(sel)];
+        if (!source) return;
+        ann.overrides[here] = cloneZone(source);
+        state.editScope = "slice";
         persist();
         renderAll();
       });
     }
-    document.querySelectorAll(".goto-slice").forEach((btn) => {
-      btn.addEventListener("click", async () => {
-        const idx = Number(btn.dataset.slice);
-        state.editScope = "slice";
-        await loadSlice(idx);
+    const useAllBtn = el("useOnAllBtn");
+    if (useAllBtn) {
+      useAllBtn.addEventListener("click", () => {
+        const z = cloneZone(ann.overrides[here]);
+        ann.x = z.x;
+        ann.y = z.y;
+        ann.tolerance = z.tolerance;
+        delete ann.overrides[here];
+        state.editScope = "all";
+        persist();
+        renderAll();
       });
-    });
+    }
+    const resetBtn = el("resetOverrideBtn");
+    if (resetBtn) {
+      resetBtn.addEventListener("click", () => {
+        delete ann.overrides[here];
+        persist();
+        renderAll();
+      });
+    }
 
     document.querySelectorAll('input[name="tolMode"]').forEach((radio) => {
       radio.addEventListener("change", () => {
@@ -710,6 +785,8 @@
         persist();
         renderMarkers();
         renderToleranceOverlay();
+        const per = el("perSlice");
+        if (per && per.querySelectorAll(".slice-chip.custom").length !== Object.keys(ann.overrides).length) rebuildZoneControls(ann);
       });
     }
     const drawBtn = el("drawShapeBtn");
@@ -785,13 +862,19 @@
 
     const fromEl = el("f-from");
     const toEl = el("f-to");
-    const applyRange = () => {
-      setRange(ann, Number(fromEl.value), Number(toEl.value));
+    // Moving one end past the other drags the other end along rather than
+    // silently swapping them.
+    const applyRange = (changed) => {
+      let from = Number(fromEl.value);
+      let to = Number(toEl.value);
+      if (changed === "from" && from > to) to = from;
+      if (changed === "to" && to < from) from = to;
+      setRange(ann, from, to);
       persist();
       renderAll();
     };
-    fromEl.addEventListener("change", applyRange);
-    toEl.addEventListener("change", applyRange);
+    fromEl.addEventListener("change", () => applyRange("from"));
+    toEl.addEventListener("change", () => applyRange("to"));
     const singleBtn = el("singleSliceBtn");
     if (singleBtn) {
       singleBtn.addEventListener("click", () => {
@@ -816,6 +899,7 @@
       inspectorEl.dataset.annId = "";
       inspectorEl.dataset.signature = "";
       inspectorEl.innerHTML = `<p class="hint placeholder">Select an annotation on the slice, or drag a new one from the palette, to edit it here.</p>`;
+      renderStageBadge(null);
       return;
     }
     // Rebuilding the inspector while typing would steal focus; only rebuild
@@ -827,6 +911,7 @@
     inspectorEl.dataset.signature = signature;
     inspectorEl.innerHTML = buildInspectorMarkup(ann);
     wireInspector(ann);
+    renderStageBadge(ann);
   }
 
   // --- export -----------------------------------------------------------------------------------
