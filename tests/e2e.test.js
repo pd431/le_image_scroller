@@ -16,6 +16,9 @@ const os = require("os");
 const path = require("path");
 const http = require("http");
 const assert = require("assert");
+const zlib = require("zlib");
+const crypto = require("crypto");
+const { execFileSync } = require("child_process");
 const { chromium } = require("playwright");
 
 const ROOT = path.resolve(__dirname, "..");
@@ -404,6 +407,7 @@ test("annotator: range, per-slice override and export carry through to the file"
     page.waitForEvent("download"),
     (async () => {
       await page.click("#exportBtn");
+      await page.check('input[name="exportWhat"][value="json"]');
       await page.click("#exportDownloadBtn");
     })(),
   ]);
@@ -511,6 +515,518 @@ test("moving one end of the slice range past the other drags it along", async ({
   await page.waitForFunction(() => /#15$/.test(document.querySelector("#allAnnotationList .slice-tag").textContent));
 });
 
+// --- browser datasets and quiz packages ---------------------------------------------------
+
+/** A small solid-colour PNG, so each fixture image has its own bytes. */
+function makePng(width, height, [r, g, b]) {
+  const crcTable = Array.from({ length: 256 }, (_, n) => {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+    return c >>> 0;
+  });
+  const crc = (buf) => {
+    let c = 0xffffffff;
+    for (const byte of buf) c = crcTable[(c ^ byte) & 0xff] ^ (c >>> 8);
+    return (c ^ 0xffffffff) >>> 0;
+  };
+  const chunk = (type, data) => {
+    const len = Buffer.alloc(4);
+    len.writeUInt32BE(data.length);
+    const body = Buffer.concat([Buffer.from(type), data]);
+    const sum = Buffer.alloc(4);
+    sum.writeUInt32BE(crc(body));
+    return Buffer.concat([len, body, sum]);
+  };
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0);
+  ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8;
+  ihdr[9] = 2;
+  const row = Buffer.concat([Buffer.from([0]), Buffer.from(Array.from({ length: width }, () => [r, g, b]).flat())]);
+  const raw = Buffer.concat(Array.from({ length: height }, () => row));
+  return Buffer.concat([
+    Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]),
+    chunk("IHDR", ihdr), chunk("IDAT", zlib.deflateSync(raw)), chunk("IEND", Buffer.alloc(0)),
+  ]);
+}
+
+const png = (name, colour, size = 8) => ({ name, mimeType: "image/png", buffer: makePng(size, size, colour) });
+const BRAIN = () => [png("brain-10.png", [200, 0, 0]), png("brain-01.png", [0, 200, 0]), png("brain-2.png", [0, 0, 200])];
+
+/** Read a zip written with the store method: { name: Buffer }. */
+function readZip(buf) {
+  let eocd = buf.length - 22;
+  while (eocd >= 0 && buf.readUInt32LE(eocd) !== 0x06054b50) eocd -= 1;
+  assert.ok(eocd >= 0, "not a zip");
+  const count = buf.readUInt16LE(eocd + 10);
+  let p = buf.readUInt32LE(eocd + 16);
+  const out = {};
+  for (let i = 0; i < count; i++) {
+    assert.strictEqual(buf.readUInt32LE(p), 0x02014b50);
+    const method = buf.readUInt16LE(p + 10);
+    const crc = buf.readUInt32LE(p + 16);
+    const size = buf.readUInt32LE(p + 20);
+    const nameLen = buf.readUInt16LE(p + 28);
+    const extraLen = buf.readUInt16LE(p + 30);
+    const commentLen = buf.readUInt16LE(p + 32);
+    const local = buf.readUInt32LE(p + 42);
+    const name = buf.toString("utf8", p + 46, p + 46 + nameLen);
+    const start = local + 30 + buf.readUInt16LE(local + 26) + buf.readUInt16LE(local + 28);
+    assert.strictEqual(method, 0, `${name} should be stored, not compressed`);
+    out[name] = buf.subarray(start, start + size);
+    assert.strictEqual(zlib.crc32 ? zlib.crc32(out[name]) : crc, crc, `${name} has a wrong CRC`);
+    p += 46 + nameLen + extraLen + commentLen;
+  }
+  return out;
+}
+
+const sha256 = (buf) => crypto.createHash("sha256").update(buf).digest("hex");
+
+/** The fingerprint scripts/lib_manifest.py computes for a set of files. */
+function pythonFingerprint(files) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "scanner-fp-"));
+  try {
+    files.forEach((f) => fs.writeFileSync(path.join(dir, f.name), f.buffer));
+    const code = "import sys, json; sys.path.insert(0, sys.argv[1]); import lib_manifest; m = lib_manifest.build_manifest(sys.argv[2]); print(json.dumps(m))";
+    return JSON.parse(execFileSync("python3", ["-c", code, path.join(ROOT, "scripts"), dir], { encoding: "utf8" }));
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** Rewrite a zip with Python: optionally deflate it, and/or replace entries. */
+function rewriteZip(src, dest, { deflate = false, replace = {}, drop = [] } = {}) {
+  const code = `
+import sys, json, zipfile, base64
+src, dest, deflate, replace, drop = sys.argv[1], sys.argv[2], sys.argv[3] == "1", json.loads(sys.argv[4]), json.loads(sys.argv[5])
+with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dest, "w", zipfile.ZIP_DEFLATED if deflate else zipfile.ZIP_STORED) as zout:
+    for name in zin.namelist():
+        if name in drop: continue
+        zout.writestr(name, base64.b64decode(replace[name]) if name in replace else zin.read(name))
+`;
+  const encoded = Object.fromEntries(Object.entries(replace).map(([k, v]) => [k, Buffer.from(v).toString("base64")]));
+  execFileSync("python3", ["-c", code, src, dest, deflate ? "1" : "0", JSON.stringify(encoded), JSON.stringify(drop)]);
+}
+
+async function importStack(page, site, files, name) {
+  await page.goto(`${site.base}/index.html`);
+  await page.waitForSelector("#datasetList li");
+  await page.setInputFiles("#pickFiles", files);
+  await page.waitForSelector("#pending:not([hidden])");
+  if (name) await page.fill("#datasetName", name);
+  await page.click("#saveDatasetBtn");
+  await page.waitForSelector("#pending", { state: "hidden" });
+  await page.waitForSelector("#datasetList li.current .ds-actions");
+}
+
+async function addLabel(page, text, fx = 0.5, fy = 0.5) {
+  await page.click('.palette-item[data-type="label"]');
+  await stageClick(page, fx, fy);
+  await page.waitForSelector("#f-text");
+  await page.fill("#f-text", text);
+}
+
+/** Export a quiz package from the annotator and return { name, file, entries }. */
+async function exportPackage(page, { confirmEmpty = false } = {}) {
+  const [download] = await Promise.all([
+    page.waitForEvent("download"),
+    (async () => {
+      await page.click("#exportBtn");
+      await page.click("#exportDownloadBtn");
+      if (confirmEmpty) await page.click("#confirmOkBtn");
+    })(),
+  ]);
+  const file = await download.path();
+  return { name: download.suggestedFilename(), file, entries: readZip(fs.readFileSync(file)) };
+}
+
+test("start page: chosen images are ordered, hashed like the Python script, and become the active stack", async ({ page, site }) => {
+  await page.goto(`${site.base}/index.html`);
+  await page.waitForSelector("#datasetList li");
+  assert.match(await page.textContent("#datasetList"), /served from data\/slices\//);
+  await page.setInputFiles("#pickFiles", [...BRAIN(), { name: "notes.txt", mimeType: "text/plain", buffer: Buffer.from("x") }]);
+  await page.waitForSelector("#pending:not([hidden])");
+  assert.deepStrictEqual(await page.$$eval("#thumbStrip .thumb-name", (els) => els.map((e) => e.textContent)), ["brain-01.png", "brain-2.png", "brain-10.png"]);
+  assert.deepStrictEqual(await page.$$eval("#thumbStrip .thumb-num", (els) => els.map((e) => e.textContent)), ["1", "2", "3"]);
+  assert.match(await page.textContent("#pendingSummary"), /^3 slices · /);
+  assert.match(await page.textContent("#importReport"), /1 file skipped \(not an image\): notes\.txt/);
+  assert.strictEqual(await page.inputValue("#datasetName"), "brain");
+
+  await page.fill("#datasetName", "Brain MRI week 3");
+  await page.click("#saveDatasetBtn");
+  await page.waitForSelector("#datasetList li.current .ds-actions");
+  assert.match(await page.textContent("#datasetList li.current"), /Brain MRI week 3.*3 slices/s);
+  assert.match(await page.textContent("#activeLine"), /Brain MRI week 3/);
+  assert.match(await page.textContent("#storageInfo"), /1 stack stored here/);
+
+  const stored = await page.evaluate(() => Scanner.listDatasets());
+  const expected = pythonFingerprint(BRAIN());
+  assert.deepStrictEqual(stored[0].files, expected.files);
+  assert.deepStrictEqual(stored[0].fileHashes, expected.fileHashes);
+  assert.strictEqual(stored[0].id, expected.datasetHash, "browser and Python fingerprints differ");
+  assert.strictEqual(stored[0].size, 8);
+
+  await page.click("#annotateLink");
+  await page.waitForSelector("#svgHost img");
+  assert.match(await page.getAttribute("#svgHost img", "src"), /^blob:/);
+  assert.strictEqual(await page.textContent("#readout"), "1 / 3");
+  assert.strictEqual(await page.$eval("#datasetSwitch", (s) => s.selectedOptions[0].textContent), "Brain MRI week 3 · 3 slices");
+  assert.match(await page.textContent("#datasetInfo"), /Brain MRI week 3 · 3 slices/);
+});
+
+test("start page: SVGs are cleaned at import, broken ones skipped, mixed sizes warned", async ({ page, site }) => {
+  await page.goto(`${site.base}/index.html`);
+  await page.waitForSelector("#datasetList li");
+  await page.setInputFiles("#pickFiles", [
+    { name: "s1.svg", mimeType: "image/svg+xml", buffer: Buffer.from(SCRIPTED_SVG) },
+    { name: "s2.svg", mimeType: "image/svg+xml", buffer: Buffer.from("<html>not svg</html>") },
+    png("s3.png", [9, 9, 9]),
+  ]);
+  await page.waitForSelector("#pending:not([hidden])");
+  const report = await page.textContent("#importReport");
+  assert.match(report, /1 file skipped \(not a valid SVG image\): s2\.svg/);
+  assert.match(report, /not all the same size/);
+  await page.click("#saveDatasetBtn");
+  await page.waitForSelector("#datasetList li.current .ds-actions");
+  const stored = await page.evaluate(async () => {
+    const [d] = await Scanner.listDatasets();
+    const blob = await Scanner.readSliceBlob(d.id, "s1.svg");
+    const text = await blob.text();
+    return { files: d.files, text, hash: d.fileHashes["s1.svg"], rehash: await Scanner.hashBytes(await blob.arrayBuffer()), size: d.size };
+  });
+  assert.deepStrictEqual(stored.files, ["s1.svg", "s3.png"]);
+  assert.ok(!/script|onclick|onerror|foreignObject|javascript:/i.test(stored.text), `unsafe markup was stored: ${stored.text}`);
+  assert.ok(/data-layer="skin"/.test(stored.text), "safe content was lost");
+  assert.strictEqual(stored.hash, stored.rehash, "hash is not of the stored bytes");
+  assert.strictEqual(stored.size, 400);
+  assert.strictEqual(await page.evaluate(() => window.__svgScript || window.__svgHandler || window.__svgForeign), undefined);
+});
+
+test("start page: a folder pick ignores sub-folders; dropped files work; the same images twice are one stack", async ({ page, site }) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "scanner-pick-"));
+  const series = path.join(dir, "knee series");
+  fs.mkdirSync(path.join(series, "old"), { recursive: true });
+  BRAIN().forEach((f) => fs.writeFileSync(path.join(series, f.name), f.buffer));
+  fs.writeFileSync(path.join(series, "old", "extra.png"), makePng(8, 8, [1, 2, 3]));
+  try {
+    await page.goto(`${site.base}/index.html`);
+    await page.waitForSelector("#datasetList li");
+    await page.setInputFiles("#pickFolder", series);
+    await page.waitForSelector("#pending:not([hidden])");
+    assert.match(await page.textContent("#pendingSummary"), /^3 slices/);
+    assert.match(await page.textContent("#importReport"), /1 file in sub-folders was ignored/);
+    assert.strictEqual(await page.inputValue("#datasetName"), "knee series");
+    await page.click("#saveDatasetBtn");
+    await page.waitForSelector("#datasetList li.current .ds-actions");
+
+    // Dropping the same three files: recognised, not duplicated.
+    await page.evaluate((files) => {
+      const dt = new DataTransfer();
+      files.forEach((f) => dt.items.add(new File([Uint8Array.from(atob(f.b64), (c) => c.charCodeAt(0))], f.name, { type: "image/png" })));
+      document.getElementById("dropZone").dispatchEvent(new DragEvent("drop", { dataTransfer: dt, bubbles: true, cancelable: true }));
+    }, BRAIN().map((f) => ({ name: f.name, b64: f.buffer.toString("base64") })));
+    await page.waitForSelector('.notice[data-notice-id="import"]');
+    assert.match(await page.textContent('.notice[data-notice-id="import"]'), /already stored as “knee series”/);
+    assert.strictEqual(await page.isHidden("#pending"), true);
+    assert.strictEqual((await page.evaluate(() => Scanner.listDatasets())).length, 1);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("cached stack: work survives a reload, the switcher changes stack, delete keeps annotations, rename shows everywhere", async ({ page, site }) => {
+  await importStack(page, site, BRAIN(), "Brain A");
+  await page.goto(`${site.base}/annotator/index.html`);
+  await page.waitForSelector("#svgHost img");
+  await addLabel(page, "Thalamus");
+  await page.reload();
+  await page.waitForSelector(".marker");
+  assert.match(await page.textContent("#annotationList"), /Thalamus/);
+
+  // Switch to the folder stack: its own (empty) annotations, fetched by URL.
+  await Promise.all([page.waitForNavigation(), page.selectOption("#datasetSwitch", "folder")]);
+  await page.waitForSelector("#svgHost svg");
+  assert.strictEqual(await page.textContent("#readout"), "1 / 40");
+  assert.strictEqual(await page.$$eval(".marker", (m) => m.length), 0);
+  assert.strictEqual(await page.$eval("#datasetSwitch", (s) => s.selectedOptions[0].textContent), "Sample stack (folder) · 40 slices");
+
+  await page.goto(`${site.base}/index.html`);
+  await page.waitForSelector("#datasetList li .ds-actions");
+  assert.match(await page.textContent("#datasetList li:first-child"), /1 annotation/);
+  await page.click("[data-rename]");
+  await page.fill("#promptInput", "Brain renamed");
+  await page.click("#promptOkBtn");
+  await page.waitForFunction(() => document.querySelector("#datasetList .ds-name").textContent === "Brain renamed");
+
+  await page.click("[data-delete]");
+  assert.match(await page.textContent(".modal"), /1 annotation stay autosaved/);
+  await page.click("#confirmOkBtn");
+  await page.waitForFunction(() => !document.querySelector("#datasetList .ds-actions"));
+  assert.strictEqual(await page.evaluate(async () => {
+    const db = await new Promise((res) => { const r = indexedDB.open("scanner"); r.onsuccess = () => res(r.result); });
+    return new Promise((res) => { const r = db.transaction("slices").objectStore("slices").count(); r.onsuccess = () => res(r.result); });
+  }), 0, "slice bytes were left behind");
+
+  // The same images again: the annotations are still there.
+  await importStack(page, site, BRAIN(), "Brain again");
+  await page.click("#annotateLink");
+  await page.waitForSelector(".marker");
+  assert.match(await page.textContent("#annotationList"), /Thalamus/);
+  assert.match(await page.$eval("#datasetSwitch", (s) => s.selectedOptions[0].textContent), /^Brain again/);
+});
+
+test("quiz package: export holds images, manifest and annotations; Python installs it with the same fingerprint", async ({ page, site }) => {
+  await importStack(page, site, BRAIN(), "Brain MRI week 3");
+  await page.goto(`${site.base}/annotator/index.html`);
+  await page.waitForSelector("#svgHost img");
+  await addLabel(page, "Thalamus");
+  const pkg = await exportPackage(page);
+  assert.match(pkg.name, /^brain-mri-week-3-quiz-\d{4}-\d{2}-\d{2}\.zip$/);
+  assert.deepStrictEqual(Object.keys(pkg.entries).sort(), ["README.txt", "annotations.json", "manifest.json", "slices/brain-01.png", "slices/brain-10.png", "slices/brain-2.png"]);
+  const manifest = JSON.parse(pkg.entries["manifest.json"].toString());
+  const expected = pythonFingerprint(BRAIN());
+  assert.strictEqual(manifest.name, "Brain MRI week 3");
+  assert.deepStrictEqual(manifest.files, expected.files);
+  assert.strictEqual(manifest.datasetHash, expected.datasetHash);
+  assert.strictEqual(manifest.sliceCount, 3);
+  BRAIN().forEach((f) => {
+    assert.ok(pkg.entries[`slices/${f.name}`].equals(f.buffer), `${f.name} bytes changed`);
+    assert.strictEqual(manifest.fileHashes[f.name], sha256(f.buffer));
+  });
+  const annotations = JSON.parse(pkg.entries["annotations.json"].toString());
+  assert.strictEqual(annotations.datasetHash, manifest.datasetHash);
+  assert.strictEqual(annotations.exportMode, "quiz");
+  assert.strictEqual(annotations.annotations[0].text, "Thalamus");
+  assert.match(pkg.entries["README.txt"].toString(), /install_package\.py/);
+
+  // The annotations-only export of the same work is the same payload.
+  const [download] = await Promise.all([
+    page.waitForEvent("download"),
+    (async () => {
+      await page.click("#exportBtn");
+      await page.check('input[name="exportWhat"][value="json"]');
+      await page.click("#exportDownloadBtn");
+    })(),
+  ]);
+  assert.strictEqual(fs.readFileSync(await download.path(), "utf8"), pkg.entries["annotations.json"].toString());
+
+  // Install into the hosted folder: refused without --force, then fingerprint parity.
+  const script = path.join(site.dir, "scripts", "install_package.py");
+  let refused = "";
+  try {
+    execFileSync("python3", [script, pkg.file], { encoding: "utf8", stdio: "pipe" });
+  } catch (err) {
+    refused = err.stderr;
+  }
+  assert.match(refused, /would replace the 40 image\(s\).*--force/s);
+  assert.strictEqual(site.json("data/slices/manifest.json").sliceCount, 40, "refused install still changed the folder");
+  const out = execFileSync("python3", [script, pkg.file, "--force"], { encoding: "utf8" });
+  assert.match(out, /3 slice\(s\)/);
+  const installed = site.json("data/slices/manifest.json");
+  assert.strictEqual(installed.datasetHash, manifest.datasetHash);
+  assert.strictEqual(installed.name, "Brain MRI week 3");
+  assert.strictEqual(site.read("quiz/annotations.json"), pkg.entries["annotations.json"].toString());
+
+  // A student's browser (nothing cached) gets the hosted quiz with no warning.
+  await page.evaluate(() => Scanner.setActiveId(null));
+  await page.goto(`${site.base}/quiz/index.html`);
+  await page.waitForSelector("#startBtn");
+  assert.match(await page.textContent("#datasetInfo"), /1 item/);
+  assert.strictEqual(await page.$$eval(".notice.warn, .notice.error", (n) => n.length), 0);
+  assert.match(await page.getAttribute("#svgHost img", "src"), /data\/slices\/brain-01\.png$/);
+});
+
+test("quiz package: the folder stack can be packaged too, and an empty quiz is confirmed first", async ({ page, site }) => {
+  await page.goto(`${site.base}/annotator/index.html`);
+  await page.waitForSelector("#svgHost svg");
+  await page.click("#exportBtn");
+  await page.click("#exportDownloadBtn");
+  await page.waitForSelector("#confirmOkBtn");
+  assert.match(await page.textContent("#confirmTitle"), /no questions/);
+  await page.click("#confirmCancelBtn");
+  await page.click("#exportCancelBtn");
+  const pkg = await exportPackage(page, { confirmEmpty: true });
+  const manifest = JSON.parse(pkg.entries["manifest.json"].toString());
+  const folder = site.json("data/slices/manifest.json");
+  assert.strictEqual(manifest.datasetHash, folder.datasetHash);
+  assert.strictEqual(Object.keys(pkg.entries).filter((n) => n.startsWith("slices/")).length, 40);
+  assert.ok(pkg.entries["slices/slice-007.svg"].equals(fs.readFileSync(path.join(site.dir, "data/slices/slice-007.svg"))));
+  assert.deepStrictEqual(JSON.parse(pkg.entries["annotations.json"].toString()).annotations, []);
+});
+
+/** Build a package in one browser context and hand back its path. */
+async function makePackage(page, site, labels = ["Thalamus"]) {
+  await importStack(page, site, BRAIN(), "Brain MRI week 3");
+  await page.goto(`${site.base}/annotator/index.html`);
+  await page.waitForSelector("#svgHost img");
+  for (let i = 0; i < labels.length; i++) await addLabel(page, labels[i], 0.3 + i * 0.3, 0.5);
+  return exportPackage(page);
+}
+
+async function freshPage(page) {
+  const context = await page.context().browser().newContext({ viewport: { width: 1400, height: 900 }, acceptDownloads: true });
+  context.setDefaultTimeout(10000);
+  const p = await context.newPage();
+  const errors = [];
+  p.on("pageerror", (e) => errors.push(e.message));
+  return { page: p, errors, close: () => context.close() };
+}
+
+test("quiz: a student imports a package, the stack is cached, and progress survives a reload", async ({ page, site }) => {
+  const pkg = await makePackage(page, site);
+  const student = await freshPage(page);
+  try {
+    const p = student.page;
+    await p.goto(`${site.base}/quiz/index.html`);
+    await p.waitForSelector("#startBtn");
+    assert.strictEqual(await p.textContent("#readout"), "1 / 40");
+    await Promise.all([p.waitForNavigation(), p.setInputFiles("#importFile", pkg.file)]);
+    await p.waitForSelector("#startBtn");
+    assert.strictEqual(await p.textContent("#readout"), "1 / 3");
+    assert.match(await p.getAttribute("#svgHost img", "src"), /^blob:/);
+    assert.match(await p.$eval("#datasetSwitch", (s) => s.selectedOptions[0].textContent), /^Brain MRI week 3 · 3 slices/);
+    assert.strictEqual(await p.$$eval(".notice.warn, .notice.error", (n) => n.length), 0);
+
+    await p.click("#startBtn");
+    await waitStep(p, "1 of 1");
+    await stageClick(p, 0.3, 0.5);
+    await p.click("#checkBtn");
+    await p.waitForSelector(".outcome-banner.correct");
+    await p.reload();
+    await p.waitForSelector("#targetsList li");
+    assert.strictEqual(await p.textContent("#progressCount"), "1 / 1");
+    assert.strictEqual(await p.textContent("#readout"), "1 / 3");
+
+    // A plain annotations.json still imports against the current stack.
+    // (Same file, so the saved progress applies to it as well.)
+    await p.setInputFiles("#importFile", { name: "annotations.json", mimeType: "application/json", buffer: pkg.entries["annotations.json"] });
+    await p.waitForSelector("#targetsList li");
+    assert.strictEqual(await p.textContent("#progressCount"), "1 / 1");
+    assert.strictEqual(await p.$$eval(".notice.warn, .notice.error", (n) => n.length), 0);
+    assert.deepStrictEqual(student.errors, []);
+  } finally {
+    await student.close();
+  }
+});
+
+test("quiz: altered, damaged and compressed packages are handled", async ({ page, site }) => {
+  const pkg = await makePackage(page, site);
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "scanner-zips-"));
+  const student = await freshPage(page);
+  try {
+    const p = student.page;
+    await p.goto(`${site.base}/quiz/index.html`);
+    await p.waitForSelector("#startBtn");
+
+    // Not a zip at all, and a zip that isn't a package: message, nothing changes.
+    await p.setInputFiles("#importFile", { name: "broken.zip", mimeType: "application/zip", buffer: Buffer.from("this is not a zip file at all, really") });
+    await p.waitForSelector(".notice.error");
+    assert.match(await p.textContent(".notice.error"), /not a zip package/);
+    const noManifest = path.join(dir, "nomanifest.zip");
+    rewriteZip(pkg.file, noManifest, { drop: ["manifest.json"] });
+    await p.setInputFiles("#importFile", noManifest);
+    await p.waitForFunction(() => /no manifest\.json/.test((document.querySelector(".notice.error") || {}).textContent || ""));
+    assert.strictEqual(await p.textContent("#readout"), "1 / 40");
+
+    // One slice swapped after export: named, and cancel leaves things alone.
+    const altered = path.join(dir, "altered.zip");
+    rewriteZip(pkg.file, altered, { replace: { "slices/brain-2.png": makePng(8, 8, [7, 7, 7]) } });
+    await p.setInputFiles("#importFile", altered);
+    await p.waitForSelector("#confirmOkBtn");
+    assert.match(await p.textContent(".modal"), /1 of 3 images differ.*brain-2\.png/s);
+    await p.click("#confirmCancelBtn");
+    assert.strictEqual(await p.textContent("#readout"), "1 / 40");
+    assert.strictEqual((await p.evaluate(() => Scanner.listDatasets())).length, 0);
+
+    // Deflated by another tool: still readable.
+    const deflated = path.join(dir, "deflated.zip");
+    rewriteZip(pkg.file, deflated, { deflate: true });
+    await Promise.all([p.waitForNavigation(), p.setInputFiles("#importFile", deflated)]);
+    await p.waitForSelector("#startBtn");
+    assert.strictEqual(await p.textContent("#readout"), "1 / 3");
+    assert.deepStrictEqual(student.errors, []);
+  } finally {
+    await student.close();
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("quiz: with browser storage blocked a package opens for the visit, with a heads-up", async ({ page, site }) => {
+  const pkg = await makePackage(page, site);
+  const student = await freshPage(page);
+  try {
+    const p = student.page;
+    await p.addInitScript(() => { Object.defineProperty(window, "indexedDB", { get: () => undefined }); });
+    await p.goto(`${site.base}/quiz/index.html`);
+    await p.waitForSelector("#startBtn");
+    await p.setInputFiles("#importFile", pkg.file);
+    await p.waitForFunction(() => document.getElementById("readout").textContent === "1 / 3");
+    await p.waitForSelector("#startBtn");
+    assert.match(await p.textContent('.notice[data-notice-id="storage"]'), /this visit only/);
+    assert.match(await p.$eval("#datasetSwitch", (s) => s.selectedOptions[0].textContent), /not saved/);
+    await p.click("#startBtn");
+    await waitStep(p, "1 of 1");
+    await stageClick(p, 0.3, 0.5);
+    await p.click("#checkBtn");
+    await p.waitForSelector(".outcome-banner.correct");
+
+    await p.goto(`${site.base}/index.html`);
+    await p.waitForSelector('.notice[data-notice-id="storage"]');
+    assert.match(await p.textContent('.notice[data-notice-id="storage"]'), /can't be kept in this browser/);
+    await p.setInputFiles("#pickFiles", BRAIN());
+    await p.waitForSelector("#pending:not([hidden])");
+    await p.click("#saveDatasetBtn");
+    await p.waitForSelector('.notice.error[data-notice-id="import"]');
+    assert.match(await p.textContent('.notice.error[data-notice-id="import"]'), /could not be saved.*build_manifest\.py/s);
+    assert.deepStrictEqual(student.errors, []);
+  } finally {
+    await student.close();
+  }
+});
+
+test("annotator: a package restores a session elsewhere, and existing autosave is offered first", async ({ page, site }) => {
+  const pkg = await makePackage(page, site, ["Thalamus", "Pons"]);
+  const other = await freshPage(page);
+  try {
+    const p = other.page;
+    await p.goto(`${site.base}/annotator/index.html`);
+    await p.waitForSelector("#svgHost svg");
+    await Promise.all([p.waitForNavigation(), p.setInputFiles("#importFile", pkg.file)]);
+    await p.waitForSelector(".marker");
+    assert.strictEqual(await p.textContent("#readout"), "1 / 3");
+    assert.strictEqual(await p.textContent("#totalAnnCount"), "2");
+    assert.match(await p.$eval("#datasetSwitch", (s) => s.selectedOptions[0].textContent), /^Brain MRI week 3/);
+
+    // Remove one, then import the package again: asked which to keep.
+    await p.click(".marker");
+    await p.click("#deleteBtn");
+    await p.waitForFunction(() => document.getElementById("totalAnnCount").textContent === "1");
+    await p.setInputFiles("#importFile", pkg.file);
+    await p.waitForSelector("#confirmOkBtn");
+    assert.match(await p.textContent(".modal"), /1 annotation is autosaved here.*package holds 2/s);
+    await Promise.all([p.waitForNavigation(), p.click("#confirmCancelBtn")]);
+    await p.waitForSelector(".marker");
+    assert.strictEqual(await p.textContent("#totalAnnCount"), "1");
+
+    // The quiz previews the annotator's current work on that stack.
+    await p.goto(`${site.base}/quiz/index.html`);
+    await p.waitForSelector("#startBtn");
+    assert.match(await p.textContent('.notice[data-notice-id="preview"]'), /Previewing the annotator's current work/);
+    assert.match(await p.textContent("#datasetInfo"), /1 item/);
+
+    // From the start page the same file opens too.
+    await p.goto(`${site.base}/index.html`);
+    await p.waitForSelector("#datasetList li.current");
+    await p.setInputFiles("#pickPackage", pkg.file);
+    await p.waitForSelector("#confirmOkBtn");
+    await p.click("#confirmOkBtn");
+    await p.waitForFunction(() => /2 annotations/.test(document.querySelector("#datasetList li.current").textContent));
+    assert.deepStrictEqual(other.errors, []);
+  } finally {
+    await other.close();
+  }
+});
+
 // --- run -------------------------------------------------------------------------------------
 
 (async () => {
@@ -521,6 +1037,7 @@ test("moving one end of the slice range past the other drags it along", async ({
     if (grep && !t.name.includes(grep)) continue;
     const site = await makeSite();
     const context = await browser.newContext({ viewport: { width: 1400, height: 900 }, acceptDownloads: true });
+    context.setDefaultTimeout(10000); // so a stuck step names its selector
     const page = await context.newPage();
     const pageErrors = [];
     page.on("pageerror", (e) => pageErrors.push(e.message));

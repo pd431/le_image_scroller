@@ -44,6 +44,7 @@
   const restartBtn = el("restartBtn");
 
   const state = {
+    source: null, // where slices come from: browser cache, a package in memory, or the folder
     manifest: null,
     loader: null,
     player: null,
@@ -58,14 +59,29 @@
   // --- loading ------------------------------------------------------------------------
 
   async function init() {
+    wireGlobalControls();
+    let source;
     try {
-      state.manifest = await S.loadManifest(MANIFEST_URL);
+      source = await S.resolveSource({ manifestUrl: MANIFEST_URL, sliceUrl: SLICE_URL });
     } catch (err) {
       S.showFatal(err);
       return;
     }
-    const m = state.manifest;
-    state.loader = S.createSliceLoader({ host: svgHost, manifest: m, sliceUrl: SLICE_URL });
+    await start(source);
+  }
+
+  /** (Re)start the page on a source. Called once at load, and again when a
+   *  package is opened without browser storage to hold it. */
+  async function start(source) {
+    if (state.player) state.player.stop();
+    state.source = source;
+    const m = state.manifest = source.manifest;
+    state.loader = S.createSliceLoader({
+      host: svgHost,
+      manifest: m,
+      sliceUrl: SLICE_URL,
+      readSlice: source.kind === "folder" ? null : source.readSlice,
+    });
     state.player = S.createPlayer({
       button: playBtn,
       interval: 300,
@@ -73,9 +89,15 @@
     });
     toleranceLayer.setAttribute("viewBox", `0 0 ${m.size} ${m.size}`);
     scrub.max = m.sliceCount;
+    S.wireDatasetSwitcher(el("datasetSwitch"), source, { startUrl: "../index.html" });
 
-    wireGlobalControls();
+    if (source.kind === "folder") await loadBundled();
+    else await loadForStack(source);
+  }
 
+  /** Folder stack: the annotations.json hosted next to this page. */
+  async function loadBundled() {
+    const m = state.manifest;
     let bundled = null;
     try {
       bundled = await S.fetchJson(DEFAULT_EXPORT_URL, "The bundled annotations file");
@@ -99,9 +121,59 @@
     }
   }
 
-  function showEmpty() {
+  /**
+   * A browser-held stack. If the annotator has work autosaved for these
+   * exact images, preview that (it is the newest); otherwise use the
+   * annotations that came in the package.
+   */
+  async function loadForStack(source) {
+    const m = state.manifest;
+    const packaged = parseText(source.record.quizText, m.sliceCount);
+    const held = S.createStore(`annotator:${source.id}:v3`).read();
+    if (Array.isArray(held) && held.length) {
+      const { annotations } = S.normalizeAnnotations(held, m.sliceCount);
+      if (annotations.length) {
+        const payload = S.buildExport({
+          manifest: m,
+          annotations,
+          exportMode: packaged ? packaged.file.exportMode : "quiz",
+          quizMode: packaged && packaged.file.exportMode === "quiz" ? packaged.file.quizMode : "full",
+        });
+        const text = JSON.stringify(payload);
+        const parsed = S.parseExportFile(JSON.parse(text), m.sliceCount);
+        if (!parsed.error) {
+          S.notify("info", "Previewing the annotator's current work on this stack. Export a quiz package from the annotator to share it.", { id: "preview" });
+          await loadQuizData(parsed.file, text, "the annotator's autosave");
+          return;
+        }
+      }
+    }
+    S.dismissNotice("preview");
+    if (packaged) {
+      await loadQuizData(packaged.file, source.record.quizText, "the package");
+      return;
+    }
+    showEmpty("This image stack has no quiz yet. Annotate it first, or use Import… to load an annotations file or a quiz package.");
+    await loadSlice(1);
+  }
+
+  function parseText(text, sliceCount) {
+    if (!text) return null;
+    try {
+      const parsed = S.parseExportFile(JSON.parse(text), sliceCount);
+      return parsed.error ? null : parsed;
+    } catch {
+      return null;
+    }
+  }
+
+  function showEmpty(message) {
+    state.quiz = null;
+    state.targets = [];
+    showcaseSection.hidden = true;
+    quizSection.hidden = true;
     datasetInfo.textContent = "No annotation file loaded";
-    inspectorEl.innerHTML = `<p class="hint placeholder">No annotations.json found next to this page. Use Import… to load one exported from the annotator.</p>`;
+    inspectorEl.innerHTML = `<p class="hint placeholder">${escapeHtml(message || "No annotations.json found next to this page. Use Import… to load one exported from the annotator, or a quiz package (.zip).")}</p>`;
   }
 
   function freshTarget(ann) {
@@ -783,7 +855,59 @@
 
   // --- import ------------------------------------------------------------------------------------
 
+  /** A quiz package: cache its stack and reload on it; without storage,
+   *  run it from memory for this visit. */
+  async function importPackageFile(file) {
+    let pkg;
+    S.notify("info", `Reading ${file.name}…`, { id: "import", dismissible: false });
+    try {
+      pkg = await S.readPackage(file);
+    } catch (err) {
+      S.notify("error", `Could not import ${file.name}: ${err.message}${err.hint ? ` ${err.hint}` : ""}`, { id: "import" });
+      return;
+    }
+    S.dismissNotice("import");
+    const { files, annotationsText, altered } = pkg;
+    if (altered.length) {
+      const ok = await S.confirmDialog({
+        title: "Some images don't match the package's fingerprint",
+        message: `${altered.length} of ${files.length} images differ from the hashes in manifest.json (${altered.slice(0, 5).join(", ")}${altered.length > 5 ? ", …" : ""}). Markers may not line up. Open it anyway?`,
+        confirmLabel: "Open anyway",
+        danger: true,
+      });
+      if (!ok) return;
+    }
+    if (!annotationsText) {
+      S.notify("error", `Could not import ${file.name}: the package has no annotations.json.`, { id: "import" });
+      return;
+    }
+    let parsed;
+    try {
+      parsed = S.parseExportFile(JSON.parse(annotationsText), pkg.record.files.length);
+    } catch {
+      parsed = { error: "its annotations.json is not valid JSON" };
+    }
+    if (parsed.error) {
+      S.notify("error", `Could not import ${file.name}: ${parsed.error}.`, { id: "import" });
+      return;
+    }
+    const record = { ...pkg.record, quizText: annotationsText };
+    S.dismissNotice("load");
+    try {
+      await S.saveDataset(record, files);
+      if (!S.setActiveId(record.id)) throw new Error("blocked");
+      location.reload();
+    } catch (err) {
+      S.notify("warn", "This browser couldn't store the package, so it is open for this visit only: reloading the page will need the file again.", { id: "storage" });
+      await start(S.memorySource(record, files));
+    }
+  }
+
   async function importAnnotationsFile(file) {
+    if (await S.looksLikeZip(file)) {
+      await importPackageFile(file);
+      return;
+    }
     let text;
     let data;
     try {

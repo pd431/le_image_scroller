@@ -15,9 +15,11 @@
     <h1>Quiz</h1>
     <div class="dataset-info" id="datasetInfo">Loading…</div>
     <div class="actions">
+      <select id="datasetSwitch" class="dataset-switch" aria-label="Image stack"></select>
+      <a class="guide-link" href="../index.html">Start</a>
       <a class="guide-link" href="../guide.html">Guide</a>
       <button id="importBtn" type="button">Import…</button>
-      <input type="file" id="importFile" accept="application/json,.json" hidden />
+      <input type="file" id="importFile" accept="application/json,.json,application/zip,.zip" hidden />
     </div>
   </header>
   <div class="notices" id="notices"></div>
@@ -76,6 +78,7 @@
   </main>
 
   <script src="../shared/common.js"></script>
+  <script src="../shared/datasets.js"></script>
   <script src="app.js"></script>
 </body>
 </html>

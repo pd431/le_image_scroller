@@ -166,18 +166,22 @@
 </head>
 <body>
   <header>
-    <a class="back" href="README.md">← Project README</a>
+    <a class="back" href="index.html">← Start page</a>
     <h1>Quick Guide</h1>
     <p>Two lightweight tools built around a stack of sliced scan images — no server, no login, just files.</p>
   </header>
 
   <main>
     <div class="flow">
-      <span class="step">Educator annotates in <strong>Annotator</strong></span>
+      <span class="step">Run <code>python3 scripts/serve.py</code></span>
       <span class="arrow">→</span>
-      <span class="step">Exports <code>annotations.json</code></span>
+      <span class="step">Choose images on the <strong>Start page</strong></span>
       <span class="arrow">→</span>
-      <span class="step">Student opens <strong>Quiz</strong></span>
+      <span class="step">Annotate in <strong>Annotator</strong></span>
+      <span class="arrow">→</span>
+      <span class="step">Export a <strong>quiz package</strong> (.zip)</span>
+      <span class="arrow">→</span>
+      <span class="step">Student imports it in <strong>Quiz</strong></span>
     </div>
 
     <div class="columns">
@@ -208,7 +212,7 @@
           </li>
           <li>
             <strong>Export</strong>
-            <span class="sub">Choose <strong>Quiz</strong> (students place things themselves) or <strong>Showcase</strong> (read-only walkthrough) — and for a quiz, <strong>Full challenge</strong> (slice hints only after a miss) or <strong>Guided</strong> (slices hinted from the start). Downloads <code>annotations.json</code>, stamped with a fingerprint of the image stack so the quiz can warn if the images change.</span>
+            <span class="sub">Choose <strong>Quiz</strong> (students place things themselves) or <strong>Showcase</strong> (read-only walkthrough) — and for a quiz, <strong>Full challenge</strong> (slice hints only after a miss) or <strong>Guided</strong> (slices hinted from the start). Downloads a <strong>quiz package</strong> (images + annotations in one zip) or just <code>annotations.json</code>, stamped with a fingerprint of the image stack so the quiz can warn if the images change.</span>
           </li>
         </ol>
 
@@ -265,21 +269,29 @@
           <li class="row"><span class="status-icon incorrect"></span> Shown (used "Show me")</li>
         </ul>
 
-        <div class="note"><strong>Import…</strong> loads a different <code>annotations.json</code> if you have one — otherwise the quiz uses whatever file is bundled next to the page.</div>
+        <div class="note"><strong>Import…</strong> loads a quiz package (<code>.zip</code>) or a different <code>annotations.json</code> if you have one — otherwise the quiz uses whatever is hosted next to the page.</div>
       </section>
 
       <section class="panel full-width">
         <h2>Using your own images</h2>
         <p class="lede">Swap out the sample apple-slice dataset for a real one</p>
         <p style="font-size:0.88rem;">
-          Drop <code>.svg</code>, <code>.png</code>, <code>.jpg</code>/<code>.jpeg</code>, <code>.gif</code> or
-          <code>.webp</code> images into <code>data/slices/</code> (names can have spaces), then run
-          <code>python3 scripts/build_manifest.py</code> to rebuild the slice list — files sort naturally by
-          name, so <code>abc2.jpg</code> comes before <code>abc10.jpg</code> whether or not you zero-pad.
-          The script also records a fingerprint of the stack, which exports carry, so both tools can warn
-          when an annotations file doesn't match the images. Changing, adding or renaming a slice shifts
-          the numbering, so re-export after any change to the images. See the <a href="README.md" style="color:#8fb3ff">README</a>
-          for the full technical reference, including the <code>annotations.json</code> schema.
+          <strong>In the browser:</strong> on the <a href="index.html" style="color:#8fb3ff">start page</a>, choose your
+          <code>.svg</code>, <code>.png</code>, <code>.jpg</code>/<code>.jpeg</code>, <code>.gif</code> or
+          <code>.webp</code> files (or a whole folder). They are put in filename order, so
+          <code>abc2.jpg</code> comes before <code>abc10.jpg</code> whether or not you zero-pad, and a numbered strip
+          lets you check that order before you save. The images are kept in this browser only; nothing is uploaded.
+          When your quiz is ready, <strong>Export…</strong> in the annotator downloads a quiz package: one zip with the
+          images and the annotations. That file is your backup, and it is what students import.
+        </p>
+        <p style="font-size:0.88rem;">
+          <strong>To host a package</strong> (e.g. on Moodle) so students need no import step, run
+          <code>python3 scripts/install_package.py your-package.zip</code> and upload the folder. You can also drop
+          images straight into <code>data/slices/</code> and run <code>python3 scripts/build_manifest.py</code>.
+          Either way a fingerprint of the stack travels with the annotations, so both tools can warn when a file
+          doesn't match the images. Changing, adding or renaming a slice shifts the numbering, so re-export after any
+          change to the images. See the <a href="README.md" style="color:#8fb3ff">README</a> for the full technical
+          reference, including the <code>annotations.json</code> schema.
         </p>
       </section>
     </div>

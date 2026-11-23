@@ -366,6 +366,7 @@
       throw new LoadError("manifest.json contains a file entry that isn't an image filename.");
     }
     return {
+      name: typeof m.name === "string" ? m.name.trim().slice(0, 120) : "",
       size: isFiniteNumber(m.size) && m.size > 0 ? m.size : 400,
       sliceCount: m.files.length,
       axis: typeof m.axis === "string" ? m.axis : "",
@@ -398,9 +399,10 @@
    * requested slice is the one now shown, false when a later request
    * superseded it.
    */
-  function createSliceLoader({ host, manifest, sliceUrl }) {
+  function createSliceLoader({ host, manifest, sliceUrl, readSlice }) {
     let seq = 0;
-    const cache = new Map();
+    const cache = new Map(); // filename -> SVG markup
+    const urls = new Map(); // filename -> object URL (browser-cached stacks)
 
     function showPlaceholder(filename, reason) {
       host.innerHTML = "";
@@ -408,6 +410,23 @@
       box.className = "slice-missing";
       box.innerHTML = `<strong>Slice image unavailable</strong><span>${escapeHtml(filename)}</span><span class="notice-hint">${escapeHtml(reason)}</span>`;
       host.appendChild(box);
+    }
+
+    // With `readSlice` the bytes come from the browser cache (or a package
+    // held in memory) as a Blob; without it they are fetched by URL.
+    async function svgMarkup(filename, index) {
+      if (readSlice) return (await readSlice(filename)).text();
+      return fetchText(sliceUrl(filename), `Slice ${index}`);
+    }
+
+    async function imageUrl(filename) {
+      if (!readSlice) return sliceUrl(filename);
+      let url = urls.get(filename);
+      if (!url) {
+        url = URL.createObjectURL(await readSlice(filename));
+        urls.set(filename, url);
+      }
+      return url;
     }
 
     async function load(index) {
@@ -419,6 +438,14 @@
       }
 
       if (!isSvgFilename(filename)) {
+        let src;
+        try {
+          src = await imageUrl(filename);
+        } catch (err) {
+          if (mySeq !== seq) return false;
+          showPlaceholder(filename, err.message);
+          return true;
+        }
         if (mySeq !== seq) return false;
         host.innerHTML = "";
         const img = document.createElement("img");
@@ -427,7 +454,7 @@
         img.addEventListener("error", () => {
           if (mySeq === seq) showPlaceholder(filename, "The file could not be loaded.");
         });
-        img.src = sliceUrl(filename);
+        img.src = src;
         host.appendChild(img);
         return true;
       }
@@ -435,7 +462,7 @@
       let markup = cache.get(filename);
       if (markup === undefined) {
         try {
-          markup = await fetchText(sliceUrl(filename), `Slice ${index}`);
+          markup = await svgMarkup(filename, index);
           cache.set(filename, markup);
         } catch (err) {
           if (mySeq !== seq) return false;
@@ -797,6 +824,7 @@
     fetchText,
     fetchJson,
     loadManifest,
+    validateManifest,
     showFatal,
     createSliceLoader,
     normalizeTolerance,
