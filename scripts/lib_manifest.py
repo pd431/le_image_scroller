@@ -92,6 +92,10 @@ def build_manifest(slices_dir, overrides=None):
         "fileHashes": file_hashes,
         "datasetHash": dataset_hash(files, file_hashes),
     }
+    # An optional display name (set by a browser-exported package) is kept.
+    name = overrides.get("name", existing.get("name"))
+    if name:
+        manifest = {"name": name, **manifest}
 
     with open(manifest_path, "w") as f:
         json.dump(manifest, f, indent=2)

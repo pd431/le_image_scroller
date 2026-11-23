@@ -75,5 +75,142 @@ class ContrastTests(unittest.TestCase):
         self.assertAlmostEqual(check_contrast.wcag_ratio(black, white), 21.0, places=2)
 
 
+class ServeTests(unittest.TestCase):
+    def test_port_fallback_and_read_only(self):
+        import http.client
+        import threading
+
+        import serve
+
+        first = serve.make_server(0, root=ROOT)
+        port = first.server_address[1]
+        # The port is taken, so the next server lands on a later one.
+        second = serve.make_server(port, root=ROOT)
+        try:
+            self.assertGreater(second.server_address[1], port)
+            thread = threading.Thread(target=second.serve_forever, daemon=True)
+            thread.start()
+            conn = http.client.HTTPConnection("127.0.0.1", second.server_address[1], timeout=5)
+            conn.request("GET", "/index.html")
+            res = conn.getresponse()
+            body = res.read()
+            self.assertEqual(res.status, 200)
+            self.assertIn(b"Radiology Scanner", body)
+            self.assertEqual(res.getheader("Cache-Control"), "no-store")
+            for method in ("POST", "PUT", "DELETE"):
+                conn = http.client.HTTPConnection("127.0.0.1", second.server_address[1], timeout=5)
+                conn.request(method, "/data/slices/evil.svg", body=b"x")
+                res = conn.getresponse()
+                res.read()
+                self.assertEqual(res.status, 405, method)
+            self.assertFalse(os.path.exists(os.path.join(ROOT, "data", "slices", "evil.svg")))
+        finally:
+            second.shutdown()
+            second.server_close()
+            first.server_close()
+
+
+class InstallPackageTests(unittest.TestCase):
+    def setUp(self):
+        import zipfile
+
+        self.zipfile = zipfile
+        self.root = tempfile.mkdtemp()
+        self.work = tempfile.mkdtemp()
+        # A package built the way the browser builds one.
+        src = os.path.join(self.work, "src")
+        os.makedirs(src)
+        self.images = {"knee-2.png": b"\x89PNG two", "knee-10.png": b"\x89PNG ten", "knee-1.png": b"\x89PNG one"}
+        for name, body in self.images.items():
+            with open(os.path.join(src, name), "wb") as f:
+                f.write(body)
+        self.manifest = lib_manifest.build_manifest(src, {"name": "Knee", "size": 512})
+        self.annotations = json.dumps({"version": 3, "exportMode": "quiz", "datasetHash": self.manifest["datasetHash"], "annotations": []})
+        self.package = self.make_zip("knee.zip")
+
+    def tearDown(self):
+        shutil.rmtree(self.root)
+        shutil.rmtree(self.work)
+
+    def make_zip(self, name, manifest=None, images=None, extra=None, annotations=True):
+        path = os.path.join(self.work, name)
+        with self.zipfile.ZipFile(path, "w") as z:
+            z.writestr("manifest.json", json.dumps(manifest or self.manifest))
+            for fname, body in (images or self.images).items():
+                z.writestr(f"slices/{fname}", body)
+            if annotations:
+                z.writestr("annotations.json", self.annotations)
+            for fname, body in (extra or {}).items():
+                z.writestr(fname, body)
+        return path
+
+    def installed(self):
+        with open(os.path.join(self.root, "data", "slices", "manifest.json")) as f:
+            return json.load(f)
+
+    def test_install_into_empty_folder_matches_fingerprint(self):
+        import install_package
+
+        lines = []
+        written = install_package.install(self.package, root=self.root, out=lines.append)
+        self.assertEqual(written["datasetHash"], self.manifest["datasetHash"])
+        m = self.installed()
+        self.assertEqual(m["files"], ["knee-1.png", "knee-2.png", "knee-10.png"])
+        self.assertEqual((m["name"], m["size"]), ("Knee", 512))
+        with open(os.path.join(self.root, "quiz", "annotations.json")) as f:
+            self.assertEqual(f.read(), self.annotations)
+        self.assertTrue(any("3 slice(s)" in line for line in lines))
+        # Installing the same package again changes nothing and needs no --force.
+        install_package.install(self.package, root=self.root, out=lines.append)
+
+    def test_refuses_to_replace_without_force(self):
+        import install_package
+
+        install_package.install(self.package, root=self.root, out=lambda *_: None)
+        other_images = {"scan-1.png": b"\x89PNG other"}
+        src = os.path.join(self.work, "other")
+        os.makedirs(src)
+        with open(os.path.join(src, "scan-1.png"), "wb") as f:
+            f.write(other_images["scan-1.png"])
+        other = self.make_zip("other.zip", manifest=lib_manifest.build_manifest(src), images=other_images)
+        with self.assertRaises(install_package.PackageError) as ctx:
+            install_package.install(other, root=self.root, out=lambda *_: None)
+        self.assertIn("--force", str(ctx.exception))
+        self.assertIn("3 image(s)", str(ctx.exception))
+        self.assertEqual(self.installed()["sliceCount"], 3)
+        self.assertEqual(os.listdir(os.path.join(self.root, "data")), ["slices"])
+        install_package.install(other, root=self.root, force=True, out=lambda *_: None)
+        self.assertEqual(self.installed()["files"], ["scan-1.png"])
+        self.assertFalse(os.path.exists(os.path.join(self.root, "data", "slices", "knee-1.png")))
+
+    def test_rejects_unsafe_paths_and_writes_nothing(self):
+        import install_package
+
+        for bad in ("../evil.png", "/abs/evil.png", "slices/../../evil.png"):
+            pkg = self.make_zip("bad.zip", extra={bad: b"x"})
+            with self.assertRaises(install_package.PackageError) as ctx:
+                install_package.install(pkg, root=self.root, out=lambda *_: None)
+            self.assertIn("Unsafe path", str(ctx.exception))
+        manifest = dict(self.manifest, files=["../knee-1.png"])
+        with self.assertRaises(install_package.PackageError):
+            install_package.install(self.make_zip("bad2.zip", manifest=manifest), root=self.root, out=lambda *_: None)
+        self.assertFalse(os.path.exists(os.path.join(self.root, "data", "slices")))
+        self.assertFalse(os.path.exists(os.path.join(os.path.dirname(self.root), "evil.png")))
+
+    def test_rejects_altered_images_and_non_packages(self):
+        import install_package
+
+        altered = self.make_zip("altered.zip", images=dict(self.images, **{"knee-2.png": b"swapped"}))
+        with self.assertRaises(install_package.PackageError) as ctx:
+            install_package.install(altered, root=self.root, out=lambda *_: None)
+        self.assertIn("fingerprint", str(ctx.exception))
+        self.assertFalse(os.path.exists(os.path.join(self.root, "data", "slices")))
+        not_zip = os.path.join(self.work, "x.zip")
+        with open(not_zip, "w") as f:
+            f.write("nope")
+        with self.assertRaises(install_package.PackageError):
+            install_package.install(not_zip, root=self.root, out=lambda *_: None)
+
+
 if __name__ == "__main__":
     unittest.main()

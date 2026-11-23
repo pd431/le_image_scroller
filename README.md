@@ -17,14 +17,45 @@ downloads, so anyone can read them.
 See **[guide.html](guide.html)** for a short, task-oriented walkthrough
 of both tools — this README is the fuller technical reference.
 
+## Quick start: images to quiz, in the browser
+
+```
+python3 scripts/serve.py
+```
+
+This serves the folder and opens the start page (`index.html`). From
+there:
+
+1. **Choose your images** — pick the files of one series, choose a
+   folder, or drop them on the page. They are put in filename order
+   (numbers counted as numbers), hashed, and shown as a numbered strip
+   so you can check the order. Name the stack and save it. The images
+   stay in this browser; nothing is uploaded.
+2. **Pick the stack to work on** — every stack stored in this browser
+   is listed, along with the folder stack in `data/slices/`.
+3. **Annotate**, try the quiz, then **Export…** a *quiz package*: one
+   zip with the images, the manifest and the annotations.
+
+Students open the package with **Import…** in the quiz. To host it
+instead (e.g. on Moodle), run `python3 scripts/install_package.py
+<package>.zip` and upload the folder; the quiz then loads with no
+import step.
+
+Stacks live in the browser's storage (IndexedDB), which a browser can
+clear — Safari does after a week without a visit. The exported package
+is the copy that lasts.
+
 Layout:
 
 ```
+index.html   start page: choose images, pick a stack (start.js, start.css)
 annotator/   educator tool (index.html, app.js, style.css)
 quiz/        student tool (index.html, app.js, style.css, annotations.json)
-shared/      common.js (runtime shared by both) and theme.css (colour tokens + layout)
-data/slices/ the image stack and its manifest.json
-scripts/     build_manifest.py, generate_slices.py, check_contrast.py
+shared/      common.js (runtime shared by all pages), datasets.js (browser
+             stacks, zip packages) and theme.css (colour tokens + layout)
+data/slices/ the folder image stack and its manifest.json
+scripts/     serve.py, install_package.py, build_manifest.py,
+             generate_slices.py, check_contrast.py
 tests/       Playwright end-to-end tests and Python unit tests
 ```
 
@@ -34,8 +65,13 @@ The pages fetch their data, so they must be served over HTTP (opening
 `index.html` from the file system shows an explanation instead):
 
 ```
-python3 -m http.server 8000      # then open http://localhost:8000/annotator/
+python3 scripts/serve.py         # opens http://localhost:8000/ in the browser
 ```
+
+`serve.py` is a read-only static server (GET and HEAD only) that picks
+the next free port if 8000 is taken; `--no-browser`, `--port` and
+`--host 0.0.0.0` are available. Any other static server works too, e.g.
+`python3 -m http.server 8000`.
 
 For Moodle, upload the whole folder as-is (a File resource or a folder
 on the web server) and link to `quiz/index.html`. Notes:
@@ -81,7 +117,20 @@ to scrub through the generated stack.
 
 ### Using your own images instead
 
-The slice list always comes from `data/slices/manifest.json`, but you
+There are two routes, and they give the same result for the same files.
+
+**In the browser** (the start page, see *Quick start*): choose the
+files and the page builds the stack for you. Stacks are stored per
+browser in IndexedDB, keyed by fingerprint; the tools use the one
+marked as in use and fall back to the folder stack when there is none.
+The header of each tool has a switcher for it. SVGs are passed through
+the sanitiser at import and the cleaned file is what is stored, hashed
+and exported. Deleting a stack removes its images but keeps its
+autosaved annotations, which come back if the same images are chosen
+again. If the browser blocks storage (private windows, some embedded
+frames) the start page says so and the folder route still works.
+
+**In the folder**: the slice list comes from `data/slices/manifest.json`, but you
 don't need to hand-edit it — `manifest.json`'s `files` list is just a
 scan of the folder, sorted naturally by filename (case-insensitive,
 and numbers inside the name sort numerically — `abc2.jpg` before
@@ -180,11 +229,24 @@ storage is blocked or full, a banner says so (the work stays in memory
 until you export). Work saved by the pre-fingerprint version is offered
 for recovery once.
 
-**Export annotations** first asks what the export is for, then
-downloads a single `annotations.json` (schema below) for the quiz
-tool to consume; **Import…** loads one back in for further editing,
-validating every entry (bad ones are skipped and reported) and
-converting older exports.
+**Export…** asks what to download and what the export is for:
+
+- **Quiz package (.zip)** — `manifest.json`, `slices/<every image>`,
+  `annotations.json` and a `README.txt`, in one file. It works from a
+  browser stack or the folder stack, is fingerprinted from the bytes
+  being packaged, and is stored without compression (the images already
+  are), written by a small zip writer in `shared/datasets.js`.
+- **Annotations only (.json)** — the single `annotations.json` (schema
+  below), for a stack whose images are already hosted next to the quiz.
+
+**Import…** takes either. An annotations file is loaded into the
+current stack, validating every entry (bad ones are skipped and
+reported) and converting older exports. A package is stored as a
+browser stack and becomes the one in use, with its annotations; if this
+browser already holds autosaved work for those exact images you are
+asked which to keep. Each image in a package is checked against the
+manifest's hashes, and you are told which differ before anything is
+stored.
 
 - **Quiz vs. showcase** — Quiz: students place the features themselves
   and get checked. Showcase: a read-only walkthrough of the annotated
@@ -266,7 +328,23 @@ Progress is saved in the browser under a key made from the image
 stack's fingerprint and the annotations file's hash, so a reload
 resumes where the student left off and a different file starts fresh.
 
+With a browser stack in use, the quiz previews the annotator's current
+autosaved work on it (so you can try a quiz before exporting), or the
+annotations that came in the package when there is no such work — a
+student's browser only ever has the latter. **Import…** in the quiz
+accepts a package as well as an annotations file: the stack is stored
+in the browser and reopens, with progress, on the next visit. If the
+browser can't store it, the package is opened for that visit only and
+a banner says so.
+
 ## Security
+
+Packages are data from someone else: zip entry names are never used as
+paths in the browser, slice names with a path separator or a leading
+dot are refused, SVGs inside are sanitised on display like any other,
+and `install_package.py` rejects absolute or `..` paths before writing
+anything and verifies the fingerprint of what it unpacked. `serve.py`
+answers GET and HEAD only.
 
 The pages are static, so the attack surface is the files they load:
 
@@ -290,14 +368,14 @@ What this does *not* give you: the quiz answers are in
 
 ```
 npm install            # Playwright, for the browser tests
-npm test               # end-to-end tests (headless Chromium, ~10 s)
+npm test               # end-to-end tests (headless Chromium, ~20 s)
 npm run test:a11y      # visual-accessibility checks (~2 min, see below)
-npm run test:py        # Python unit tests: manifest hashing, contrast maths
+npm run test:py        # Python unit tests: manifest hashing, serve, package install, contrast maths
 npm run check:contrast # APCA + WCAG 2.2 AA check of the colour tokens
 npm run check:all      # all of the above
 ```
 
-`tests/a11y.test.js` opens both tools in nine UI states at seven
+`tests/a11y.test.js` opens the start page and both tools in fourteen UI states at seven
 viewports (1920 down to a 390px phone, tablets with touch) and, for
 every interactive element, checks that nothing covers it, that it is
 at least 24×24 CSS px (32 on touch), that it has an accessible name,
@@ -307,6 +385,13 @@ It runs in Chromium, and also in Firefox when Playwright's Firefox is
 installed (`npx playwright install firefox`); Firefox matters because
 it always draws spinner buttons inside number inputs, which is what
 first hid the slice range fields.
+
+The end-to-end tests cover the browser workflow as well: choosing
+files and folders, the cleaned SVG import, stacks surviving a reload,
+package export checked entry by entry, package import in both tools
+(including altered, damaged and compressed zips, and blocked storage),
+and fingerprint parity — a package exported by the browser is installed
+by `install_package.py` and must produce the same `datasetHash`.
 
 `shared/theme.css` holds every colour as a token on `:root`.
 `scripts/check_contrast.py` checks each foreground/background pairing

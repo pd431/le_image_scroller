@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<!-- Only this folder's own scripts may run: the backstop behind the SVG
+     sanitiser and output escaping. -->
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; connect-src 'self'; object-src 'none'; base-uri 'none'; form-action 'none'" />
+<title>Radiology Scanner</title>
+<link rel="stylesheet" href="shared/theme.css" />
+<link rel="stylesheet" href="start.css" />
+</head>
+<body>
+  <header>
+    <h1>Radiology Scanner</h1>
+    <div class="dataset-info" id="datasetInfo">Loading…</div>
+    <div class="actions">
+      <a class="guide-link" href="guide.html">Guide</a>
+    </div>
+  </header>
+  <div class="notices" id="notices"></div>
+
+  <main class="start">
+    <section class="panel step" id="stepImport" aria-labelledby="stepImportTitle">
+      <h2 id="stepImportTitle"><span class="step-num" aria-hidden="true">1</span> Choose your images</h2>
+      <p class="hint">Pick the slices of one series (SVG, PNG, JPEG, GIF or WebP). They are put in filename order, numbers counted as numbers, and kept in this browser. Nothing is uploaded.</p>
+      <div class="drop-zone" id="dropZone">
+        <p>Drop image files or a folder here, or:</p>
+        <div class="btn-row">
+          <button type="button" id="pickFilesBtn" class="primary">Choose images…</button>
+          <button type="button" id="pickFolderBtn">Choose a folder…</button>
+          <button type="button" id="pickPackageBtn">Open a quiz package (.zip)…</button>
+        </div>
+        <input type="file" id="pickFiles" accept="image/*,.svg,.png,.jpg,.jpeg,.gif,.webp" multiple hidden />
+        <input type="file" id="pickFolder" webkitdirectory multiple hidden />
+        <input type="file" id="pickPackage" accept="application/zip,.zip" hidden />
+      </div>
+      <div class="progress-row" id="importProgressRow" hidden>
+        <progress id="importProgress" max="1" value="0" aria-label="Reading images"></progress>
+        <span id="importProgressText" aria-live="polite"></span>
+      </div>
+
+      <div class="pending" id="pending" hidden>
+        <h3 id="pendingSummary"></h3>
+        <ul class="import-report" id="importReport"></ul>
+        <ol class="thumb-strip" id="thumbStrip" aria-label="Slices in order" tabindex="0"></ol>
+        <div class="name-row">
+          <label for="datasetName">Name this stack</label>
+          <input type="text" id="datasetName" maxlength="120" autocomplete="off" />
+        </div>
+        <div class="btn-row">
+          <button type="button" id="saveDatasetBtn" class="primary">Save</button>
+          <button type="button" id="cancelImportBtn">Cancel</button>
+        </div>
+      </div>
+    </section>
+
+    <section class="panel step" id="stepDatasets" aria-labelledby="stepDatasetsTitle">
+      <h2 id="stepDatasetsTitle"><span class="step-num" aria-hidden="true">2</span> Pick the stack to work on</h2>
+      <ul class="dataset-list" id="datasetList"></ul>
+      <p class="hint" id="storageInfo"></p>
+      <p class="hint">Stacks are kept in this browser only, and a browser may clear its storage. An exported quiz package is the copy that lasts.</p>
+    </section>
+
+    <section class="panel step" id="stepWork" aria-labelledby="stepWorkTitle">
+      <h2 id="stepWorkTitle"><span class="step-num" aria-hidden="true">3</span> Annotate, try it, export</h2>
+      <p id="activeLine"></p>
+      <div class="btn-row">
+        <a class="button-link primary" id="annotateLink" href="annotator/index.html">Annotate</a>
+        <a class="button-link" id="quizLink" href="quiz/index.html">Try the quiz</a>
+      </div>
+      <p class="hint">In the annotator, <strong>Export</strong> downloads a quiz package: one zip with the images, the manifest and the annotations. Students open it with Import in the quiz, or you install it into this folder with <code>python3 scripts/install_package.py</code> to host it.</p>
+    </section>
+  </main>
+
+  <script src="shared/common.js"></script>
+  <script src="shared/datasets.js"></script>
+  <script src="start.js"></script>
+</body>
+</html>

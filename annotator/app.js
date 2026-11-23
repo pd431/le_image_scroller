@@ -34,6 +34,7 @@
   const PALETTE_HINT_DEFAULT = paletteHintEl.textContent;
 
   const state = {
+    source: null, // where slices come from: browser cache or the folder stack
     manifest: null,
     store: null,
     loader: null,
@@ -56,7 +57,7 @@
     if (ok) {
       S.dismissNotice("storage");
     } else {
-      S.notify("warn", "Autosave isn't working in this browser, so changes will be lost when the page reloads. Use Export annotations to keep your work.", { id: "storage", dismissible: false });
+      S.notify("warn", "Autosave isn't working in this browser, so changes will be lost when the page reloads. Use Export to keep your work.", { id: "storage", dismissible: false });
     }
   }
 
@@ -92,14 +93,21 @@
 
   async function init() {
     try {
-      state.manifest = await S.loadManifest(MANIFEST_URL);
+      state.source = await S.resolveSource({ manifestUrl: MANIFEST_URL, sliceUrl: SLICE_URL });
     } catch (err) {
       S.showFatal(err);
       return;
     }
-    const m = state.manifest;
+    const source = state.source;
+    const m = state.manifest = source.manifest;
     state.store = S.createStore(`annotator:${m.datasetHash || "unfingerprinted"}:v3`);
-    state.loader = S.createSliceLoader({ host: svgHost, manifest: m, sliceUrl: SLICE_URL });
+    state.loader = S.createSliceLoader({
+      host: svgHost,
+      manifest: m,
+      sliceUrl: SLICE_URL,
+      readSlice: source.kind === "folder" ? null : source.readSlice,
+    });
+    S.wireDatasetSwitcher(el("datasetSwitch"), source, { startUrl: "../index.html" });
     state.player = S.createPlayer({
       button: playBtn,
       interval: 300,
@@ -108,12 +116,12 @@
 
     scrub.max = m.sliceCount;
     toleranceLayer.setAttribute("viewBox", `0 0 ${m.size} ${m.size}`);
-    datasetInfo.textContent = `${m.sliceCount} slices · ${m.axis || ""}`;
+    datasetInfo.textContent = [source.kind === "folder" ? "" : source.name, `${m.sliceCount} slice${m.sliceCount === 1 ? "" : "s"}`, m.axis].filter(Boolean).join(" · ");
 
     if (!S.storageAvailable()) {
-      S.notify("warn", "This browser is blocking storage (common inside an embedded frame), so autosave is off. Use Export annotations to keep your work.", { id: "storage", dismissible: false });
+      S.notify("warn", "This browser is blocking storage (common inside an embedded frame), so autosave is off. Use Export to keep your work.", { id: "storage", dismissible: false });
     }
-    if (!m.datasetHash) {
+    if (!m.datasetHash && source.kind === "folder") {
       S.notify("info", "This image stack has no fingerprint, so exports can't be checked against it later. Run `python3 scripts/build_manifest.py` to add one.", { id: "nohash" });
     }
 
@@ -918,15 +926,25 @@
 
   function downloadAnnotations(exportMode, quizMode) {
     const payload = S.buildExport({ manifest: state.manifest, annotations: state.annotations, exportMode, quizMode });
-    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement("a");
-    a.href = url;
-    a.download = "annotations.json";
-    document.body.appendChild(a);
-    a.click();
-    a.remove();
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    S.downloadBlob(new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" }), "annotations.json");
+  }
+
+  /** One zip with the images, the manifest and the annotations. */
+  async function downloadPackage(exportMode, quizMode, onProgress) {
+    const { blob, annotationsText } = await S.buildPackage({
+      source: state.source,
+      makeExport: (manifest) => S.buildExport({ manifest, annotations: state.annotations, exportMode, quizMode }),
+      onProgress,
+    });
+    S.downloadBlob(blob, S.packageFilename(state.source.manifest.name || state.source.record?.name || "slices", exportMode));
+    // Remember what was exported so the quiz can preview in the same mode.
+    if (state.source.kind === "cache") {
+      try {
+        await S.updateDataset(state.source.id, { quizText: annotationsText });
+      } catch {
+        /* the download already happened; nothing to tell the user */
+      }
+    }
   }
 
   function openExportModal() {
@@ -934,7 +952,16 @@
     backdrop.className = "modal-backdrop open";
     backdrop.innerHTML = `
       <div class="modal" role="dialog" aria-modal="true" aria-labelledby="exportTitle">
-        <h3 id="exportTitle">Export annotations</h3>
+        <h3 id="exportTitle">Export</h3>
+        <fieldset>
+          <legend>What do you want to download?</legend>
+          <label><input type="radio" name="exportWhat" value="package" checked />
+            <span><strong>Quiz package (.zip)</strong><br /><em>Images, manifest and annotations in one file. This is what students import, and your backup.</em></span>
+          </label>
+          <label><input type="radio" name="exportWhat" value="json" />
+            <span><strong>Annotations only (.json)</strong><br /><em>For a stack whose images are already hosted next to the quiz.</em></span>
+          </label>
+        </fieldset>
         <fieldset>
           <legend>What are you exporting this for?</legend>
           <label><input type="radio" name="exportMode" value="quiz" checked />
@@ -953,7 +980,11 @@
             <span><strong>Guided</strong><br /><em>Shown which slices each feature is on from the start; only the spot is tested.</em></span>
           </label>
         </fieldset>
-        <p class="hint">${state.manifest.datasetHash ? "The export carries this image stack's fingerprint, so the quiz can warn if the images change." : "This image stack has no fingerprint; the export can't be checked against it later."}</p>
+        <p class="hint">${state.manifest.datasetHash ? "The export carries this image stack's fingerprint, so the quiz can warn if the images change." : "A package is fingerprinted as it is built; an annotations-only export of this stack can't be checked later."}</p>
+        <div class="progress-row" id="exportProgressRow" hidden>
+          <progress id="exportProgress" max="1" value="0" aria-label="Building package"></progress>
+          <span id="exportProgressText" aria-live="polite"></span>
+        </div>
         <div class="modal-actions">
           <button type="button" id="exportCancelBtn">Cancel</button>
           <button type="button" id="exportDownloadBtn" class="primary">Download</button>
@@ -967,7 +998,9 @@
         if (radio.checked) quizModeFieldset.style.display = radio.value === "quiz" ? "" : "none";
       });
     });
+    let busy = false;
     const close = () => {
+      if (busy) return;
       backdrop.remove();
       document.removeEventListener("keydown", onKey);
     };
@@ -977,10 +1010,41 @@
     backdrop.querySelector("#exportCancelBtn").addEventListener("click", close);
     backdrop.addEventListener("click", (e) => { if (e.target === backdrop) close(); });
     document.addEventListener("keydown", onKey);
-    backdrop.querySelector("#exportDownloadBtn").addEventListener("click", () => {
+    const downloadBtn = backdrop.querySelector("#exportDownloadBtn");
+    downloadBtn.addEventListener("click", async () => {
+      const what = backdrop.querySelector('input[name="exportWhat"]:checked').value;
       const exportMode = backdrop.querySelector('input[name="exportMode"]:checked').value;
-      const quizMode = backdrop.querySelector('input[name="quizMode"]:checked').value;
-      downloadAnnotations(exportMode, exportMode === "quiz" ? quizMode : undefined);
+      const quizMode = exportMode === "quiz" ? backdrop.querySelector('input[name="quizMode"]:checked').value : undefined;
+      if (what === "json") {
+        downloadAnnotations(exportMode, quizMode);
+        close();
+        return;
+      }
+      if (!state.annotations.length) {
+        const ok = await S.confirmDialog({
+          title: "This package has no questions",
+          message: "There are no annotations on this stack yet, so the package will hold the images and an empty quiz. Export it anyway?",
+          confirmLabel: "Export anyway",
+        });
+        if (!ok) return;
+      }
+      busy = true;
+      backdrop.querySelectorAll("button, input").forEach((c) => { c.disabled = true; });
+      const row = backdrop.querySelector("#exportProgressRow");
+      const bar = backdrop.querySelector("#exportProgress");
+      const text = backdrop.querySelector("#exportProgressText");
+      row.hidden = false;
+      try {
+        await downloadPackage(exportMode, quizMode, (i, n) => {
+          bar.max = Math.max(n, 1);
+          bar.value = i;
+          text.textContent = `${Math.round((i / Math.max(n, 1)) * 100)}%`;
+        });
+        S.dismissNotice("export");
+      } catch (err) {
+        S.notify("error", `The package could not be built: ${err.message}`, { id: "export" });
+      }
+      busy = false;
       close();
     });
   }
@@ -988,6 +1052,10 @@
   // --- import -----------------------------------------------------------------------------------
 
   async function importAnnotationsFile(file) {
+    if (await S.looksLikeZip(file)) {
+      if (await S.importPackageForEditing(file)) location.reload();
+      return;
+    }
     let data;
     try {
       data = JSON.parse(await file.text());

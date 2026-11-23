@@ -108,7 +108,66 @@ async function setSlider(page, value) {
   await page.waitForFunction((i) => document.getElementById("readout").textContent.startsWith(`${i} /`), value);
 }
 
+const svgSlice = (name, fill) => ({
+  name,
+  mimeType: "image/svg+xml",
+  buffer: Buffer.from(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 400 400"><rect width="400" height="400" fill="${fill}"/></svg>`),
+});
+const PICKED = [
+  svgSlice("knee-1.svg", "#123"), svgSlice("knee-2.svg", "#234"), svgSlice("knee-3.svg", "#345"),
+  { name: "notes.txt", mimeType: "text/plain", buffer: Buffer.from("x") },
+];
+
+async function storeStack(page) {
+  await page.waitForSelector("#datasetList li");
+  await page.setInputFiles("#pickFiles", PICKED);
+  await page.waitForSelector("#pending:not([hidden])");
+  await page.fill("#datasetName", "Knee MRI, sagittal series, week 3 teaching set");
+  await page.click("#saveDatasetBtn");
+  await page.waitForSelector("#datasetList li.current .ds-actions");
+}
+
 const STATES = [
+  {
+    name: "start: no stack stored",
+    url: "/index.html",
+    setup: async (page) => { await page.waitForSelector("#datasetList li"); },
+  },
+  {
+    name: "start: images chosen, not yet saved",
+    url: "/index.html",
+    setup: async (page) => {
+      await page.waitForSelector("#datasetList li");
+      await page.setInputFiles("#pickFiles", PICKED);
+      await page.waitForSelector("#pending:not([hidden])");
+    },
+  },
+  {
+    name: "start: a stored stack",
+    url: "/index.html",
+    setup: storeStack,
+  },
+  {
+    name: "start: rename dialog",
+    url: "/index.html",
+    setup: async (page) => {
+      await storeStack(page);
+      await page.click("[data-rename]");
+      await page.waitForSelector("#promptInput");
+    },
+  },
+  {
+    name: "annotator: on a browser-stored stack",
+    url: "/index.html",
+    setup: async (page) => {
+      await storeStack(page);
+      await page.click("#annotateLink");
+      await page.waitForSelector("#svgHost svg");
+      await page.click('.palette-item[data-type="label"]');
+      await stageClick(page, 0.5, 0.5);
+      await page.waitForSelector("#f-text");
+    },
+  },
   {
     name: "annotator: empty",
     url: "/annotator/index.html",

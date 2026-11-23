@@ -15,10 +15,12 @@
     <h1>Annotator</h1>
     <div class="dataset-info" id="datasetInfo">Loading dataset…</div>
     <div class="actions">
+      <select id="datasetSwitch" class="dataset-switch" aria-label="Image stack"></select>
+      <a class="guide-link" href="../index.html">Start</a>
       <a class="guide-link" href="../guide.html">Guide</a>
       <button id="importBtn" type="button">Import…</button>
-      <input type="file" id="importFile" accept="application/json,.json" hidden />
-      <button id="exportBtn" type="button">Export annotations</button>
+      <input type="file" id="importFile" accept="application/json,.json,application/zip,.zip" hidden />
+      <button id="exportBtn" type="button">Export…</button>
       <button id="clearBtn" type="button" class="danger">Clear all</button>
     </div>
   </header>
@@ -98,6 +100,7 @@
   </main>
 
   <script src="../shared/common.js"></script>
+  <script src="../shared/datasets.js"></script>
   <script src="app.js"></script>
 </body>
 </html>
